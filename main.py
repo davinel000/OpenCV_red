@@ -39,6 +39,8 @@ class PreviewConfig:
     show_diff: bool
     show_mask: bool
     show_overlay: bool
+    window_size: int
+    mosaic: bool
 
 
 @dataclass
@@ -56,6 +58,17 @@ class DetectionConfig:
     max_area: int
     aspect_ratio_min: float
     aspect_ratio_max: float
+    orientation_mode: str
+    angle_tolerance_deg: float
+    length_min_cm: float
+    length_max_cm: float
+
+
+@dataclass
+class TrackerConfig:
+    match_distance_px: float
+    min_persist_frames: int
+    cooldown_frames: int
 
 
 @dataclass
@@ -65,6 +78,7 @@ class AppConfig:
     preview: PreviewConfig
     baseline: BaselineConfig
     detection: DetectionConfig
+    tracker: TrackerConfig
 
 
 class VideoSource:
@@ -227,6 +241,105 @@ class BaselineManager:
         return True
 
 
+@dataclass
+class Blob:
+    contour: np.ndarray
+    bbox: Tuple[int, int, int, int]
+    area: float
+    centroid: Tuple[float, float]
+    angle_deg: float
+    length_px: float
+
+
+@dataclass
+class Track:
+    track_id: int
+    centroid: Tuple[float, float]
+    bbox: Tuple[int, int, int, int]
+    area: float
+    angle_deg: float
+    length_px: float
+    frames_seen: int
+    last_seen_frame: int
+    confirmed: bool
+
+
+class StrokeTracker:
+    def __init__(self, cfg: TrackerConfig) -> None:
+        self.cfg = cfg
+        self.tracks: List[Track] = []
+        self.next_id = 1
+        self.count = 0
+        self.last_confirm_frame = -1_000_000
+
+    def reset(self) -> None:
+        self.tracks = []
+        self.next_id = 1
+        self.count = 0
+        self.last_confirm_frame = -1_000_000
+
+    def update(self, blobs: List[Blob], frame_idx: int) -> List[Track]:
+        assigned = set()
+        for track in self.tracks:
+            best_idx = -1
+            best_dist = float("inf")
+            for i, blob in enumerate(blobs):
+                if i in assigned:
+                    continue
+                dx = blob.centroid[0] - track.centroid[0]
+                dy = blob.centroid[1] - track.centroid[1]
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = i
+            if best_idx >= 0 and best_dist <= self.cfg.match_distance_px:
+                blob = blobs[best_idx]
+                assigned.add(best_idx)
+                track.centroid = blob.centroid
+                track.bbox = blob.bbox
+                track.area = blob.area
+                track.angle_deg = blob.angle_deg
+                track.length_px = blob.length_px
+                track.frames_seen += 1
+                track.last_seen_frame = frame_idx
+
+        for i, blob in enumerate(blobs):
+            if i in assigned:
+                continue
+            self.tracks.append(
+                Track(
+                    track_id=self.next_id,
+                    centroid=blob.centroid,
+                    bbox=blob.bbox,
+                    area=blob.area,
+                    angle_deg=blob.angle_deg,
+                    length_px=blob.length_px,
+                    frames_seen=1,
+                    last_seen_frame=frame_idx,
+                    confirmed=False,
+                )
+            )
+            self.next_id += 1
+
+        alive: List[Track] = []
+        for track in self.tracks:
+            if frame_idx - track.last_seen_frame <= self.cfg.min_persist_frames + 2:
+                alive.append(track)
+        self.tracks = alive
+
+        confirmed_now: List[Track] = []
+        for track in self.tracks:
+            if track.confirmed:
+                continue
+            if track.frames_seen >= self.cfg.min_persist_frames:
+                if frame_idx - self.last_confirm_frame >= self.cfg.cooldown_frames:
+                    track.confirmed = True
+                    self.count += 1
+                    self.last_confirm_frame = frame_idx
+                    confirmed_now.append(track)
+        return confirmed_now
+
+
 def load_config(path: Path) -> AppConfig:
     data = yaml.safe_load(path.read_text())
     cam = data["camera"]
@@ -234,6 +347,7 @@ def load_config(path: Path) -> AppConfig:
     preview = data["preview"]
     baseline = data["baseline"]
     detection = data["detection"]
+    tracker = data["tracker"]
     return AppConfig(
         camera=CameraConfig(
             index=int(cam["index"]),
@@ -256,6 +370,8 @@ def load_config(path: Path) -> AppConfig:
             show_diff=bool(preview["show_diff"]),
             show_mask=bool(preview["show_mask"]),
             show_overlay=bool(preview["show_overlay"]),
+            window_size=int(preview["window_size"]),
+            mosaic=bool(preview["mosaic"]),
         ),
         baseline=BaselineConfig(
             path=str(baseline["path"]),
@@ -269,6 +385,15 @@ def load_config(path: Path) -> AppConfig:
             max_area=int(detection["max_area"]),
             aspect_ratio_min=float(detection["aspect_ratio_min"]),
             aspect_ratio_max=float(detection["aspect_ratio_max"]),
+            orientation_mode=str(detection["orientation_mode"]),
+            angle_tolerance_deg=float(detection["angle_tolerance_deg"]),
+            length_min_cm=float(detection["length_min_cm"]),
+            length_max_cm=float(detection["length_max_cm"]),
+        ),
+        tracker=TrackerConfig(
+            match_distance_px=float(tracker["match_distance_px"]),
+            min_persist_frames=int(tracker["min_persist_frames"]),
+            cooldown_frames=int(tracker["cooldown_frames"]),
         ),
     )
 
@@ -283,12 +408,14 @@ def main() -> int:
     aligner = ROIAligner(cfg.roi)
     viz = Visualizer(cfg.preview)
     baseline_mgr = BaselineManager(cfg.baseline)
+    tracker = StrokeTracker(cfg.tracker)
 
     window_raw = "raw"
     window_warp = "warp"
     window_diff = "diff"
     window_mask = "mask"
     window_overlay = "overlay"
+    window_mosaic = "mosaic"
 
     def on_mouse(event, x, y, _flags, _param):
         if cfg.roi.mode != "manual":
@@ -298,19 +425,36 @@ def main() -> int:
         if event == cv2.EVENT_RBUTTONDOWN:
             aligner.reset_manual_points()
 
-    if cfg.preview.show_raw:
-        cv2.namedWindow(window_raw)
+    if cfg.preview.show_raw and not cfg.preview.mosaic:
+        cv2.namedWindow(window_raw, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(window_raw, on_mouse)
-    if cfg.preview.show_warp:
-        cv2.namedWindow(window_warp)
-    if cfg.preview.show_diff:
-        cv2.namedWindow(window_diff)
-    if cfg.preview.show_mask:
-        cv2.namedWindow(window_mask)
-    if cfg.preview.show_overlay:
-        cv2.namedWindow(window_overlay)
+    if cfg.preview.show_warp and not cfg.preview.mosaic:
+        cv2.namedWindow(window_warp, cv2.WINDOW_NORMAL)
+    if cfg.preview.show_diff and not cfg.preview.mosaic:
+        cv2.namedWindow(window_diff, cv2.WINDOW_NORMAL)
+    if cfg.preview.show_mask and not cfg.preview.mosaic:
+        cv2.namedWindow(window_mask, cv2.WINDOW_NORMAL)
+    if cfg.preview.show_overlay and not cfg.preview.mosaic:
+        cv2.namedWindow(window_overlay, cv2.WINDOW_NORMAL)
+    if cfg.preview.mosaic:
+        cv2.namedWindow(window_mosaic, cv2.WINDOW_NORMAL)
+
+    if not cfg.preview.mosaic:
+        if cfg.preview.show_raw:
+            cv2.resizeWindow(window_raw, cfg.preview.window_size, cfg.preview.window_size)
+        if cfg.preview.show_warp:
+            cv2.resizeWindow(window_warp, cfg.preview.window_size, cfg.preview.window_size)
+        if cfg.preview.show_diff:
+            cv2.resizeWindow(window_diff, cfg.preview.window_size, cfg.preview.window_size)
+        if cfg.preview.show_mask:
+            cv2.resizeWindow(window_mask, cfg.preview.window_size, cfg.preview.window_size)
+        if cfg.preview.show_overlay:
+            cv2.resizeWindow(window_overlay, cfg.preview.window_size, cfg.preview.window_size)
+    else:
+        cv2.resizeWindow(window_mosaic, cfg.preview.window_size * 2, cfg.preview.window_size * 2)
 
     paused = False
+    frame_idx = 0
     while True:
         if not paused:
             frame = source.read()
@@ -330,7 +474,7 @@ def main() -> int:
 
         if cfg.preview.show_raw:
             cv2.imshow(window_raw, raw_vis)
-        if cfg.preview.show_warp:
+        if cfg.preview.show_warp and not cfg.preview.mosaic:
             if warped is None:
                 blank = np.zeros((cfg.roi.warp_size, cfg.roi.warp_size, 3), dtype=np.uint8)
                 cv2.putText(blank, "Waiting for ROI...", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
@@ -353,6 +497,7 @@ def main() -> int:
         diff_vis = None
         mask_vis = None
         overlay_vis = None
+        blobs: List[Blob] = []
         if warped is not None and baseline_mgr.baseline is not None:
             gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
             base_gray = cv2.cvtColor(baseline_mgr.baseline, cv2.COLOR_BGR2GRAY)
@@ -379,26 +524,102 @@ def main() -> int:
                 aspect = h / float(w)
                 if aspect < cfg.detection.aspect_ratio_min or aspect > cfg.detection.aspect_ratio_max:
                     continue
+                length_px = float(max(w, h))
+                px_per_cm = cfg.roi.warp_size / 40.0
+                length_cm = length_px / px_per_cm
+                if length_cm < cfg.detection.length_min_cm or length_cm > cfg.detection.length_max_cm:
+                    continue
+                angle_deg = 90.0
+                if len(cnt) >= 5:
+                    pts = cnt.reshape(-1, 2).astype(np.float32)
+                    mean, eigenvectors = cv2.PCACompute(pts, mean=None)
+                    vx, vy = eigenvectors[0]
+                    angle_deg = float(np.degrees(np.arctan2(vy, vx)))
+                if cfg.detection.orientation_mode == "vertical":
+                    angle_abs = abs((angle_deg + 90.0) % 180.0 - 90.0)
+                    if angle_abs > cfg.detection.angle_tolerance_deg:
+                        continue
+                cx = x + w / 2.0
+                cy = y + h / 2.0
+                blobs.append(
+                    Blob(
+                        contour=cnt,
+                        bbox=(x, y, w, h),
+                        area=area,
+                        centroid=(cx, cy),
+                        angle_deg=angle_deg,
+                        length_px=length_px,
+                    )
+                )
                 cv2.rectangle(overlay_vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-        if cfg.preview.show_diff:
+        confirmed = tracker.update(blobs, frame_idx=frame_idx)
+        frame_idx += 1
+        for tr in confirmed:
+            print(
+                f"EVENT stroke_id={tr.track_id} centroid=({tr.centroid[0]:.1f},{tr.centroid[1]:.1f}) "
+                f"bbox={tr.bbox} angle={tr.angle_deg:.1f} length_px={tr.length_px:.1f}"
+            )
+
+        if overlay_vis is not None:
+            cv2.putText(
+                overlay_vis,
+                f"Count: {tracker.count}",
+                (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            for tr in tracker.tracks:
+                if not tr.confirmed:
+                    continue
+                x, y, w, h = tr.bbox
+                cv2.rectangle(overlay_vis, (x, y), (x + w, y + h), (255, 255, 0), 2)
+
+        if cfg.preview.show_diff and not cfg.preview.mosaic:
             if diff_vis is None:
                 blank = np.zeros((cfg.roi.warp_size, cfg.roi.warp_size), dtype=np.uint8)
                 cv2.imshow(window_diff, blank)
             else:
                 cv2.imshow(window_diff, diff_vis)
-        if cfg.preview.show_mask:
+        if cfg.preview.show_mask and not cfg.preview.mosaic:
             if mask_vis is None:
                 blank = np.zeros((cfg.roi.warp_size, cfg.roi.warp_size), dtype=np.uint8)
                 cv2.imshow(window_mask, blank)
             else:
                 cv2.imshow(window_mask, mask_vis)
-        if cfg.preview.show_overlay:
+        if cfg.preview.show_overlay and not cfg.preview.mosaic:
             if overlay_vis is None:
                 blank = np.zeros((cfg.roi.warp_size, cfg.roi.warp_size, 3), dtype=np.uint8)
                 cv2.imshow(window_overlay, blank)
             else:
                 cv2.imshow(window_overlay, overlay_vis)
+
+        if cfg.preview.mosaic:
+            size = cfg.preview.window_size
+            def _prep(img, is_color=True):
+                if img is None:
+                    if is_color:
+                        img = np.zeros((cfg.roi.warp_size, cfg.roi.warp_size, 3), dtype=np.uint8)
+                    else:
+                        img = np.zeros((cfg.roi.warp_size, cfg.roi.warp_size), dtype=np.uint8)
+                if not is_color and img.ndim == 2:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                return cv2.resize(img, (size, size))
+
+            a = _prep(raw_vis, True)
+            b = _prep(warped, True)
+            c = _prep(diff_vis, False)
+            if cfg.preview.show_overlay:
+                d = _prep(overlay_vis, True)
+            else:
+                d = _prep(mask_vis, False)
+            top = cv2.hconcat([a, b])
+            bottom = cv2.hconcat([c, d])
+            mosaic = cv2.vconcat([top, bottom])
+            cv2.imshow(window_mosaic, mosaic)
 
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord("q")):
@@ -420,6 +641,8 @@ def main() -> int:
                     print("Baseline captured and saved.")
                 else:
                     print("Baseline capture failed.")
+        if key == ord("r"):
+            tracker.reset()
 
     source.release()
     cv2.destroyAllWindows()

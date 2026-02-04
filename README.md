@@ -21,6 +21,7 @@ python main.py --config config.yaml
 - `q` or `Esc` quit
 - `c` clear manual ROI points
 - `b` capture baseline (Milestone 2)
+- `r` reset tracker/count (Milestone 4)
 
 ## ROI Alignment
 
@@ -52,6 +53,13 @@ python main.py --config config.yaml
 
 - Diff and mask windows are enabled by default.
 - Use `detection.diff_threshold`, `detection.min_area`, and `detection.aspect_ratio_*` to tune sensitivity.
+- Use `preview.window_size` to control initial window size.
+- Use `preview.mosaic: true` for a single 2x2 view.
+
+## Tracking (Milestone 4)
+
+- New strokes trigger events after persisting `tracker.min_persist_frames`.
+- Orientation filtering is controlled by `detection.orientation_mode`.
 
 ## Next Milestone
 

@@ -25,6 +25,10 @@ preview:
   show_diff: true
   show_mask: true
   show_overlay: true
+  # Initial size for each preview window (pixels)
+  window_size: 500
+  # If true, show a single mosaic window instead of multiple windows
+  mosaic: false
 
 baseline:
   # Path to save/load baseline image (warped ROI)
@@ -41,3 +45,13 @@ detection:
   max_area: 50000
   aspect_ratio_min: 2.0
   aspect_ratio_max: 20.0
+  # "vertical" or "any"
+  orientation_mode: "vertical"
+  angle_tolerance_deg: 25
+  length_min_cm: 4.0
+  length_max_cm: 7.0
+
+tracker:
+  match_distance_px: 40
+  min_persist_frames: 3
+  cooldown_frames: 10

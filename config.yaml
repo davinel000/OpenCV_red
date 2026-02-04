@@ -1,0 +1,43 @@
+camera:
+  index: 1
+  width: 1280  
+  height: 720
+  fps: 30
+  # Optional: set to a video file path for offline testing
+  video_file: null
+
+roi:
+  # "aruco" or "manual"
+  mode: "manual"
+  # Warp output size (square)
+  warp_size: 1000
+  # Used only in aruco mode
+  aruco_dictionary: "DICT_4X4_50"
+  # Order matters: top-left, top-right, bottom-right, bottom-left
+  aruco_ids: [0, 1, 2, 3]
+  # Cache for manual 4-point selection
+  roi_cache_path: "roi_points.json"
+
+preview:
+  show_raw: true
+  show_warp: true
+  show_fps: true
+  show_diff: true
+  show_mask: true
+  show_overlay: true
+
+baseline:
+  # Path to save/load baseline image (warped ROI)
+  path: "baseline.png"
+  # Capture baseline as an average of N frames
+  capture_frames: 30
+  # Delay between baseline capture frames (ms)
+  capture_delay_ms: 10
+
+detection:
+  blur_ksize: 5
+  diff_threshold: 30
+  min_area: 200
+  max_area: 50000
+  aspect_ratio_min: 2.0
+  aspect_ratio_max: 20.0

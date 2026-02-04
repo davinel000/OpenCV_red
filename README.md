@@ -22,6 +22,7 @@ python main.py --config config.yaml
 - `c` clear manual ROI points
 - `b` capture baseline (Milestone 2)
 - `r` reset tracker/count (Milestone 4)
+- `f` clear freeze mask (Milestone 5)
 
 ## ROI Alignment
 
@@ -60,6 +61,20 @@ python main.py --config config.yaml
 
 - New strokes trigger events after persisting `tracker.min_persist_frames`.
 - Orientation filtering is controlled by `detection.orientation_mode`.
+
+## Robustness (Milestone 5)
+
+- `detection.mode: "contrast"` or `"red"` for red-ink detection.
+- `freeze_mask.enabled: true` prevents re-triggering on confirmed strokes.
+- If detection is too strict, disable filters:
+  - `detection.use_aspect: false`
+  - `detection.use_length: false`
+  - `detection.use_orientation: false`
+
+## Runtime Tuning
+
+- Enable `preview.show_controls: true` to get a controls window with trackbars.
+- Changes apply live without restarting.
 
 ## Next Milestone
 

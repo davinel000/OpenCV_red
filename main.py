@@ -41,6 +41,7 @@ class PreviewConfig:
     show_overlay: bool
     window_size: int
     mosaic: bool
+    show_controls: bool
 
 
 @dataclass
@@ -52,16 +53,31 @@ class BaselineConfig:
 
 @dataclass
 class DetectionConfig:
+    mode: str
     blur_ksize: int
     diff_threshold: int
+    morph_open_ksize: int
+    morph_close_ksize: int
+    use_clahe: bool
+    clahe_clip: float
+    clahe_grid: int
     min_area: int
     max_area: int
+    use_aspect: bool
     aspect_ratio_min: float
     aspect_ratio_max: float
+    use_length: bool
     orientation_mode: str
+    use_orientation: bool
     angle_tolerance_deg: float
     length_min_cm: float
     length_max_cm: float
+    red_hue_low1: int
+    red_hue_high1: int
+    red_hue_low2: int
+    red_hue_high2: int
+    red_sat_min: int
+    red_val_min: int
 
 
 @dataclass
@@ -72,6 +88,12 @@ class TrackerConfig:
 
 
 @dataclass
+class FreezeMaskConfig:
+    enabled: bool
+    dilate_ksize: int
+
+
+@dataclass
 class AppConfig:
     camera: CameraConfig
     roi: ROIConfig
@@ -79,6 +101,7 @@ class AppConfig:
     baseline: BaselineConfig
     detection: DetectionConfig
     tracker: TrackerConfig
+    freeze_mask: FreezeMaskConfig
 
 
 class VideoSource:
@@ -348,6 +371,7 @@ def load_config(path: Path) -> AppConfig:
     baseline = data["baseline"]
     detection = data["detection"]
     tracker = data["tracker"]
+    freeze_mask = data["freeze_mask"]
     return AppConfig(
         camera=CameraConfig(
             index=int(cam["index"]),
@@ -372,6 +396,7 @@ def load_config(path: Path) -> AppConfig:
             show_overlay=bool(preview["show_overlay"]),
             window_size=int(preview["window_size"]),
             mosaic=bool(preview["mosaic"]),
+            show_controls=bool(preview["show_controls"]),
         ),
         baseline=BaselineConfig(
             path=str(baseline["path"]),
@@ -379,21 +404,40 @@ def load_config(path: Path) -> AppConfig:
             capture_delay_ms=int(baseline["capture_delay_ms"]),
         ),
         detection=DetectionConfig(
+            mode=str(detection["mode"]),
             blur_ksize=int(detection["blur_ksize"]),
             diff_threshold=int(detection["diff_threshold"]),
+            morph_open_ksize=int(detection["morph_open_ksize"]),
+            morph_close_ksize=int(detection["morph_close_ksize"]),
+            use_clahe=bool(detection["use_clahe"]),
+            clahe_clip=float(detection["clahe_clip"]),
+            clahe_grid=int(detection["clahe_grid"]),
             min_area=int(detection["min_area"]),
             max_area=int(detection["max_area"]),
+            use_aspect=bool(detection["use_aspect"]),
             aspect_ratio_min=float(detection["aspect_ratio_min"]),
             aspect_ratio_max=float(detection["aspect_ratio_max"]),
+            use_length=bool(detection["use_length"]),
             orientation_mode=str(detection["orientation_mode"]),
+            use_orientation=bool(detection["use_orientation"]),
             angle_tolerance_deg=float(detection["angle_tolerance_deg"]),
             length_min_cm=float(detection["length_min_cm"]),
             length_max_cm=float(detection["length_max_cm"]),
+            red_hue_low1=int(detection["red_hue_low1"]),
+            red_hue_high1=int(detection["red_hue_high1"]),
+            red_hue_low2=int(detection["red_hue_low2"]),
+            red_hue_high2=int(detection["red_hue_high2"]),
+            red_sat_min=int(detection["red_sat_min"]),
+            red_val_min=int(detection["red_val_min"]),
         ),
         tracker=TrackerConfig(
             match_distance_px=float(tracker["match_distance_px"]),
             min_persist_frames=int(tracker["min_persist_frames"]),
             cooldown_frames=int(tracker["cooldown_frames"]),
+        ),
+        freeze_mask=FreezeMaskConfig(
+            enabled=bool(freeze_mask["enabled"]),
+            dilate_ksize=int(freeze_mask["dilate_ksize"]),
         ),
     )
 
@@ -409,6 +453,7 @@ def main() -> int:
     viz = Visualizer(cfg.preview)
     baseline_mgr = BaselineManager(cfg.baseline)
     tracker = StrokeTracker(cfg.tracker)
+    freeze_mask = None
 
     window_raw = "raw"
     window_warp = "warp"
@@ -416,6 +461,7 @@ def main() -> int:
     window_mask = "mask"
     window_overlay = "overlay"
     window_mosaic = "mosaic"
+    window_controls = "controls"
 
     def on_mouse(event, x, y, _flags, _param):
         if cfg.roi.mode != "manual":
@@ -452,6 +498,28 @@ def main() -> int:
             cv2.resizeWindow(window_overlay, cfg.preview.window_size, cfg.preview.window_size)
     else:
         cv2.resizeWindow(window_mosaic, cfg.preview.window_size * 2, cfg.preview.window_size * 2)
+
+    if cfg.preview.show_controls:
+        cv2.namedWindow(window_controls, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_controls, 420, 640)
+        cv2.createTrackbar("mode 0=contrast 1=red", window_controls, 0 if cfg.detection.mode == "contrast" else 1, 1, lambda _v: None)
+        cv2.createTrackbar("diff_threshold", window_controls, cfg.detection.diff_threshold, 255, lambda _v: None)
+        cv2.createTrackbar("blur_ksize", window_controls, cfg.detection.blur_ksize, 25, lambda _v: None)
+        cv2.createTrackbar("morph_open", window_controls, cfg.detection.morph_open_ksize, 21, lambda _v: None)
+        cv2.createTrackbar("morph_close", window_controls, cfg.detection.morph_close_ksize, 21, lambda _v: None)
+        cv2.createTrackbar("min_area", window_controls, cfg.detection.min_area, 200000, lambda _v: None)
+        cv2.createTrackbar("max_area", window_controls, cfg.detection.max_area, 200000, lambda _v: None)
+        cv2.createTrackbar("use_aspect", window_controls, 1 if cfg.detection.use_aspect else 0, 1, lambda _v: None)
+        cv2.createTrackbar("aspect_min_x10", window_controls, int(cfg.detection.aspect_ratio_min * 10), 400, lambda _v: None)
+        cv2.createTrackbar("aspect_max_x10", window_controls, int(cfg.detection.aspect_ratio_max * 10), 400, lambda _v: None)
+        cv2.createTrackbar("use_length", window_controls, 1 if cfg.detection.use_length else 0, 1, lambda _v: None)
+        cv2.createTrackbar("len_min_x10", window_controls, int(cfg.detection.length_min_cm * 10), 400, lambda _v: None)
+        cv2.createTrackbar("len_max_x10", window_controls, int(cfg.detection.length_max_cm * 10), 400, lambda _v: None)
+        cv2.createTrackbar("use_orient", window_controls, 1 if cfg.detection.use_orientation else 0, 1, lambda _v: None)
+        cv2.createTrackbar("angle_tol", window_controls, int(cfg.detection.angle_tolerance_deg), 90, lambda _v: None)
+        cv2.createTrackbar("clahe", window_controls, 1 if cfg.detection.use_clahe else 0, 1, lambda _v: None)
+        cv2.createTrackbar("clahe_clip_x10", window_controls, int(cfg.detection.clahe_clip * 10), 50, lambda _v: None)
+        cv2.createTrackbar("clahe_grid", window_controls, int(cfg.detection.clahe_grid), 16, lambda _v: None)
 
     paused = False
     frame_idx = 0
@@ -499,19 +567,71 @@ def main() -> int:
         overlay_vis = None
         blobs: List[Blob] = []
         if warped is not None and baseline_mgr.baseline is not None:
-            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-            base_gray = cv2.cvtColor(baseline_mgr.baseline, cv2.COLOR_BGR2GRAY)
+            if freeze_mask is None or freeze_mask.shape[:2] != warped.shape[:2]:
+                freeze_mask = np.zeros(warped.shape[:2], dtype=np.uint8)
+
             k = max(1, cfg.detection.blur_ksize)
             if k % 2 == 0:
                 k += 1
-            if k > 1:
-                gray = cv2.GaussianBlur(gray, (k, k), 0)
-                base_gray = cv2.GaussianBlur(base_gray, (k, k), 0)
-            diff = cv2.subtract(base_gray, gray)
-            _, mask = cv2.threshold(diff, cfg.detection.diff_threshold, 255, cv2.THRESH_BINARY)
-            diff_vis = diff
-            mask_vis = mask
 
+            if cfg.detection.mode == "red":
+                hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
+                hsv_base = cv2.cvtColor(baseline_mgr.baseline, cv2.COLOR_BGR2HSV)
+                mask1 = cv2.inRange(
+                    hsv,
+                    (cfg.detection.red_hue_low1, cfg.detection.red_sat_min, cfg.detection.red_val_min),
+                    (cfg.detection.red_hue_high1, 255, 255),
+                )
+                mask2 = cv2.inRange(
+                    hsv,
+                    (cfg.detection.red_hue_low2, cfg.detection.red_sat_min, cfg.detection.red_val_min),
+                    (cfg.detection.red_hue_high2, 255, 255),
+                )
+                mask_red = cv2.bitwise_or(mask1, mask2)
+                base1 = cv2.inRange(
+                    hsv_base,
+                    (cfg.detection.red_hue_low1, cfg.detection.red_sat_min, cfg.detection.red_val_min),
+                    (cfg.detection.red_hue_high1, 255, 255),
+                )
+                base2 = cv2.inRange(
+                    hsv_base,
+                    (cfg.detection.red_hue_low2, cfg.detection.red_sat_min, cfg.detection.red_val_min),
+                    (cfg.detection.red_hue_high2, 255, 255),
+                )
+                base_red = cv2.bitwise_or(base1, base2)
+                mask = cv2.bitwise_and(mask_red, cv2.bitwise_not(base_red))
+                diff_vis = mask.copy()
+            else:
+                gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+                base_gray = cv2.cvtColor(baseline_mgr.baseline, cv2.COLOR_BGR2GRAY)
+                if k > 1:
+                    gray = cv2.GaussianBlur(gray, (k, k), 0)
+                    base_gray = cv2.GaussianBlur(base_gray, (k, k), 0)
+                if cfg.detection.use_clahe:
+                    clahe = cv2.createCLAHE(clipLimit=cfg.detection.clahe_clip, tileGridSize=(cfg.detection.clahe_grid, cfg.detection.clahe_grid))
+                    gray = clahe.apply(gray)
+                    base_gray = clahe.apply(base_gray)
+                diff = cv2.subtract(base_gray, gray)
+                _, mask = cv2.threshold(diff, cfg.detection.diff_threshold, 255, cv2.THRESH_BINARY)
+                diff_vis = diff
+
+            if cfg.detection.morph_open_ksize > 1:
+                ok = cfg.detection.morph_open_ksize
+                if ok % 2 == 0:
+                    ok += 1
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ok, ok))
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            if cfg.detection.morph_close_ksize > 1:
+                ck = cfg.detection.morph_close_ksize
+                if ck % 2 == 0:
+                    ck += 1
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ck, ck))
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+            if cfg.freeze_mask.enabled and freeze_mask is not None:
+                mask[freeze_mask > 0] = 0
+
+            mask_vis = mask
             overlay_vis = warped.copy()
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for cnt in contours:
@@ -521,21 +641,23 @@ def main() -> int:
                 x, y, w, h = cv2.boundingRect(cnt)
                 if w == 0:
                     continue
-                aspect = h / float(w)
-                if aspect < cfg.detection.aspect_ratio_min or aspect > cfg.detection.aspect_ratio_max:
-                    continue
+                if cfg.detection.use_aspect:
+                    aspect = h / float(w)
+                    if aspect < cfg.detection.aspect_ratio_min or aspect > cfg.detection.aspect_ratio_max:
+                        continue
                 length_px = float(max(w, h))
                 px_per_cm = cfg.roi.warp_size / 40.0
                 length_cm = length_px / px_per_cm
-                if length_cm < cfg.detection.length_min_cm or length_cm > cfg.detection.length_max_cm:
-                    continue
+                if cfg.detection.use_length:
+                    if length_cm < cfg.detection.length_min_cm or length_cm > cfg.detection.length_max_cm:
+                        continue
                 angle_deg = 90.0
                 if len(cnt) >= 5:
                     pts = cnt.reshape(-1, 2).astype(np.float32)
-                    mean, eigenvectors = cv2.PCACompute(pts, mean=None)
+                    _mean, eigenvectors = cv2.PCACompute(pts, mean=None)
                     vx, vy = eigenvectors[0]
                     angle_deg = float(np.degrees(np.arctan2(vy, vx)))
-                if cfg.detection.orientation_mode == "vertical":
+                if cfg.detection.use_orientation and cfg.detection.orientation_mode == "vertical":
                     angle_abs = abs((angle_deg + 90.0) % 180.0 - 90.0)
                     if angle_abs > cfg.detection.angle_tolerance_deg:
                         continue
@@ -560,11 +682,20 @@ def main() -> int:
                 f"EVENT stroke_id={tr.track_id} centroid=({tr.centroid[0]:.1f},{tr.centroid[1]:.1f}) "
                 f"bbox={tr.bbox} angle={tr.angle_deg:.1f} length_px={tr.length_px:.1f}"
             )
+            if cfg.freeze_mask.enabled and freeze_mask is not None:
+                x, y, w, h = tr.bbox
+                cv2.rectangle(freeze_mask, (x, y), (x + w, y + h), 255, -1)
+                dk = max(1, cfg.freeze_mask.dilate_ksize)
+                if dk % 2 == 0:
+                    dk += 1
+                if dk > 1:
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dk, dk))
+                    freeze_mask = cv2.dilate(freeze_mask, kernel)
 
         if overlay_vis is not None:
             cv2.putText(
                 overlay_vis,
-                f"Count: {tracker.count}",
+                f"Count: {tracker.count} | Mode: {cfg.detection.mode}",
                 (10, 24),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -639,10 +770,15 @@ def main() -> int:
                 ok = baseline_mgr.capture(_get_warped)
                 if ok:
                     print("Baseline captured and saved.")
+                    if freeze_mask is not None:
+                        freeze_mask[:] = 0
                 else:
                     print("Baseline capture failed.")
         if key == ord("r"):
             tracker.reset()
+        if key == ord("f"):
+            if freeze_mask is not None:
+                freeze_mask[:] = 0
 
     source.release()
     cv2.destroyAllWindows()
@@ -651,3 +787,22 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+    if cfg.preview.show_controls:
+        cfg.detection.mode = "contrast" if cv2.getTrackbarPos("mode 0=contrast 1=red", window_controls) == 0 else "red"
+        cfg.detection.diff_threshold = cv2.getTrackbarPos("diff_threshold", window_controls)
+        cfg.detection.blur_ksize = max(1, cv2.getTrackbarPos("blur_ksize", window_controls))
+        cfg.detection.morph_open_ksize = cv2.getTrackbarPos("morph_open", window_controls)
+        cfg.detection.morph_close_ksize = cv2.getTrackbarPos("morph_close", window_controls)
+        cfg.detection.min_area = cv2.getTrackbarPos("min_area", window_controls)
+        cfg.detection.max_area = cv2.getTrackbarPos("max_area", window_controls)
+        cfg.detection.use_aspect = cv2.getTrackbarPos("use_aspect", window_controls) == 1
+        cfg.detection.aspect_ratio_min = cv2.getTrackbarPos("aspect_min_x10", window_controls) / 10.0
+        cfg.detection.aspect_ratio_max = cv2.getTrackbarPos("aspect_max_x10", window_controls) / 10.0
+        cfg.detection.use_length = cv2.getTrackbarPos("use_length", window_controls) == 1
+        cfg.detection.length_min_cm = cv2.getTrackbarPos("len_min_x10", window_controls) / 10.0
+        cfg.detection.length_max_cm = cv2.getTrackbarPos("len_max_x10", window_controls) / 10.0
+        cfg.detection.use_orientation = cv2.getTrackbarPos("use_orient", window_controls) == 1
+        cfg.detection.angle_tolerance_deg = cv2.getTrackbarPos("angle_tol", window_controls)
+        cfg.detection.use_clahe = cv2.getTrackbarPos("clahe", window_controls) == 1
+        cfg.detection.clahe_clip = cv2.getTrackbarPos("clahe_clip_x10", window_controls) / 10.0
+        cfg.detection.clahe_grid = max(2, cv2.getTrackbarPos("clahe_grid", window_controls))

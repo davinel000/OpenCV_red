@@ -28,7 +28,9 @@ preview:
   # Initial size for each preview window (pixels)
   window_size: 500
   # If true, show a single mosaic window instead of multiple windows
-  mosaic: false
+  mosaic: true
+  # Show runtime controls window with trackbars
+  show_controls: true
 
 baseline:
   # Path to save/load baseline image (warped ROI)
@@ -39,17 +41,39 @@ baseline:
   capture_delay_ms: 10
 
 detection:
+  # "contrast" or "red"
+  mode: "contrast"
   blur_ksize: 5
-  diff_threshold: 30
-  min_area: 200
+  diff_threshold: 20 # 30
+  morph_open_ksize: 3
+  morph_close_ksize: 3
+  # Illumination normalization (contrast mode)
+  use_clahe: false
+  clahe_clip: 2.0
+  clahe_grid: 8
+  min_area: 100 #200
   max_area: 50000
+  use_aspect: false #true
   aspect_ratio_min: 2.0
   aspect_ratio_max: 20.0
+  use_length: false # true
   # "vertical" or "any"
   orientation_mode: "vertical"
+  use_orientation: true
   angle_tolerance_deg: 25
-  length_min_cm: 4.0
+  length_min_cm: 2.0
   length_max_cm: 7.0
+  # Red mode HSV thresholds (0-179 hue)
+  red_hue_low1: 0
+  red_hue_high1: 10
+  red_hue_low2: 170
+  red_hue_high2: 179
+  red_sat_min: 80
+  red_val_min: 50
+
+freeze_mask:
+  enabled: true
+  dilate_ksize: 5
 
 tracker:
   match_distance_px: 40

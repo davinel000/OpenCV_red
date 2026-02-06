@@ -42,6 +42,7 @@ class PreviewConfig:
     window_size: int
     mosaic: bool
     show_controls: bool
+    simple_controls: bool
 
 
 @dataclass
@@ -54,6 +55,8 @@ class BaselineConfig:
 @dataclass
 class DetectionConfig:
     mode: str
+    preview_all: bool
+    preview_only: bool
     blur_ksize: int
     diff_threshold: int
     morph_open_ksize: int
@@ -397,6 +400,7 @@ def load_config(path: Path) -> AppConfig:
             window_size=int(preview["window_size"]),
             mosaic=bool(preview["mosaic"]),
             show_controls=bool(preview["show_controls"]),
+            simple_controls=bool(preview.get("simple_controls", True)),
         ),
         baseline=BaselineConfig(
             path=str(baseline["path"]),
@@ -405,6 +409,8 @@ def load_config(path: Path) -> AppConfig:
         ),
         detection=DetectionConfig(
             mode=str(detection["mode"]),
+            preview_all=bool(detection.get("preview_all", False)),
+            preview_only=bool(detection.get("preview_only", False)),
             blur_ksize=int(detection["blur_ksize"]),
             diff_threshold=int(detection["diff_threshold"]),
             morph_open_ksize=int(detection["morph_open_ksize"]),
@@ -442,18 +448,98 @@ def load_config(path: Path) -> AppConfig:
     )
 
 
+def save_config(path: Path, cfg: AppConfig) -> None:
+    data = {
+        "camera": {
+            "index": cfg.camera.index,
+            "width": cfg.camera.width,
+            "height": cfg.camera.height,
+            "fps": cfg.camera.fps,
+            "video_file": cfg.camera.video_file,
+        },
+        "roi": {
+            "mode": cfg.roi.mode,
+            "warp_size": cfg.roi.warp_size,
+            "aruco_dictionary": cfg.roi.aruco_dictionary,
+            "aruco_ids": cfg.roi.aruco_ids,
+            "roi_cache_path": cfg.roi.roi_cache_path,
+        },
+        "preview": {
+            "show_raw": cfg.preview.show_raw,
+            "show_warp": cfg.preview.show_warp,
+            "show_fps": cfg.preview.show_fps,
+            "show_diff": cfg.preview.show_diff,
+            "show_mask": cfg.preview.show_mask,
+            "show_overlay": cfg.preview.show_overlay,
+            "window_size": cfg.preview.window_size,
+            "mosaic": cfg.preview.mosaic,
+            "show_controls": cfg.preview.show_controls,
+            "simple_controls": cfg.preview.simple_controls,
+        },
+        "baseline": {
+            "path": cfg.baseline.path,
+            "capture_frames": cfg.baseline.capture_frames,
+            "capture_delay_ms": cfg.baseline.capture_delay_ms,
+        },
+        "detection": {
+            "mode": cfg.detection.mode,
+            "preview_all": cfg.detection.preview_all,
+            "preview_only": cfg.detection.preview_only,
+            "blur_ksize": cfg.detection.blur_ksize,
+            "diff_threshold": cfg.detection.diff_threshold,
+            "morph_open_ksize": cfg.detection.morph_open_ksize,
+            "morph_close_ksize": cfg.detection.morph_close_ksize,
+            "use_clahe": cfg.detection.use_clahe,
+            "clahe_clip": cfg.detection.clahe_clip,
+            "clahe_grid": cfg.detection.clahe_grid,
+            "min_area": cfg.detection.min_area,
+            "max_area": cfg.detection.max_area,
+            "use_aspect": cfg.detection.use_aspect,
+            "aspect_ratio_min": cfg.detection.aspect_ratio_min,
+            "aspect_ratio_max": cfg.detection.aspect_ratio_max,
+            "use_length": cfg.detection.use_length,
+            "orientation_mode": cfg.detection.orientation_mode,
+            "use_orientation": cfg.detection.use_orientation,
+            "angle_tolerance_deg": cfg.detection.angle_tolerance_deg,
+            "length_min_cm": cfg.detection.length_min_cm,
+            "length_max_cm": cfg.detection.length_max_cm,
+            "red_hue_low1": cfg.detection.red_hue_low1,
+            "red_hue_high1": cfg.detection.red_hue_high1,
+            "red_hue_low2": cfg.detection.red_hue_low2,
+            "red_hue_high2": cfg.detection.red_hue_high2,
+            "red_sat_min": cfg.detection.red_sat_min,
+            "red_val_min": cfg.detection.red_val_min,
+        },
+        "freeze_mask": {
+            "enabled": cfg.freeze_mask.enabled,
+            "dilate_ksize": cfg.freeze_mask.dilate_ksize,
+        },
+        "tracker": {
+            "match_distance_px": cfg.tracker.match_distance_px,
+            "min_persist_frames": cfg.tracker.min_persist_frames,
+            "cooldown_frames": cfg.tracker.cooldown_frames,
+        },
+    }
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args()
 
-    cfg = load_config(Path(args.config))
+    config_path = Path(args.config)
+    cfg = load_config(config_path)
     source = VideoSource(cfg.camera)
     aligner = ROIAligner(cfg.roi)
     viz = Visualizer(cfg.preview)
     baseline_mgr = BaselineManager(cfg.baseline)
     tracker = StrokeTracker(cfg.tracker)
     freeze_mask = None
+    simple_controls = cfg.preview.simple_controls
+    help_overlay = True
+    preview_all = cfg.detection.preview_all
+    preview_only = cfg.detection.preview_only
 
     window_raw = "raw"
     window_warp = "warp"
@@ -471,7 +557,24 @@ def main() -> int:
         if event == cv2.EVENT_RBUTTONDOWN:
             aligner.reset_manual_points()
 
-    if cfg.preview.show_raw and not cfg.preview.mosaic:
+    def on_mouse_mosaic(event, x, y, _flags, _param):
+        if cfg.roi.mode != "manual":
+            return
+        size = cfg.preview.window_size
+        if x >= size or y >= size:
+            return
+        if frame is None:
+            return
+        scale_x = frame.shape[1] / float(size)
+        scale_y = frame.shape[0] / float(size)
+        mx = int(x * scale_x)
+        my = int(y * scale_y)
+        if event == cv2.EVENT_LBUTTONDOWN:
+            aligner.set_manual_point((mx, my))
+        if event == cv2.EVENT_RBUTTONDOWN:
+            aligner.reset_manual_points()
+
+    if cfg.preview.show_raw:
         cv2.namedWindow(window_raw, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(window_raw, on_mouse)
     if cfg.preview.show_warp and not cfg.preview.mosaic:
@@ -484,6 +587,7 @@ def main() -> int:
         cv2.namedWindow(window_overlay, cv2.WINDOW_NORMAL)
     if cfg.preview.mosaic:
         cv2.namedWindow(window_mosaic, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(window_mosaic, on_mouse_mosaic)
 
     if not cfg.preview.mosaic:
         if cfg.preview.show_raw:
@@ -499,27 +603,31 @@ def main() -> int:
     else:
         cv2.resizeWindow(window_mosaic, cfg.preview.window_size * 2, cfg.preview.window_size * 2)
 
-    if cfg.preview.show_controls:
+    def build_controls(simple: bool) -> None:
         cv2.namedWindow(window_controls, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_controls, 420, 640)
-        cv2.createTrackbar("mode 0=contrast 1=red", window_controls, 0 if cfg.detection.mode == "contrast" else 1, 1, lambda _v: None)
-        cv2.createTrackbar("diff_threshold", window_controls, cfg.detection.diff_threshold, 255, lambda _v: None)
-        cv2.createTrackbar("blur_ksize", window_controls, cfg.detection.blur_ksize, 25, lambda _v: None)
-        cv2.createTrackbar("morph_open", window_controls, cfg.detection.morph_open_ksize, 21, lambda _v: None)
-        cv2.createTrackbar("morph_close", window_controls, cfg.detection.morph_close_ksize, 21, lambda _v: None)
-        cv2.createTrackbar("min_area", window_controls, cfg.detection.min_area, 200000, lambda _v: None)
-        cv2.createTrackbar("max_area", window_controls, cfg.detection.max_area, 200000, lambda _v: None)
-        cv2.createTrackbar("use_aspect", window_controls, 1 if cfg.detection.use_aspect else 0, 1, lambda _v: None)
-        cv2.createTrackbar("aspect_min_x10", window_controls, int(cfg.detection.aspect_ratio_min * 10), 400, lambda _v: None)
-        cv2.createTrackbar("aspect_max_x10", window_controls, int(cfg.detection.aspect_ratio_max * 10), 400, lambda _v: None)
-        cv2.createTrackbar("use_length", window_controls, 1 if cfg.detection.use_length else 0, 1, lambda _v: None)
-        cv2.createTrackbar("len_min_x10", window_controls, int(cfg.detection.length_min_cm * 10), 400, lambda _v: None)
-        cv2.createTrackbar("len_max_x10", window_controls, int(cfg.detection.length_max_cm * 10), 400, lambda _v: None)
-        cv2.createTrackbar("use_orient", window_controls, 1 if cfg.detection.use_orientation else 0, 1, lambda _v: None)
-        cv2.createTrackbar("angle_tol", window_controls, int(cfg.detection.angle_tolerance_deg), 90, lambda _v: None)
-        cv2.createTrackbar("clahe", window_controls, 1 if cfg.detection.use_clahe else 0, 1, lambda _v: None)
-        cv2.createTrackbar("clahe_clip_x10", window_controls, int(cfg.detection.clahe_clip * 10), 50, lambda _v: None)
-        cv2.createTrackbar("clahe_grid", window_controls, int(cfg.detection.clahe_grid), 16, lambda _v: None)
+        cv2.createTrackbar("mode 0=C 1=R", window_controls, 0 if cfg.detection.mode == "contrast" else 1, 1, lambda _v: None)
+        cv2.createTrackbar("thr", window_controls, cfg.detection.diff_threshold, 255, lambda _v: None)
+        cv2.createTrackbar("minA", window_controls, cfg.detection.min_area, 200000, lambda _v: None)
+        cv2.createTrackbar("maxA", window_controls, cfg.detection.max_area, 200000, lambda _v: None)
+        cv2.createTrackbar("blur", window_controls, cfg.detection.blur_ksize, 25, lambda _v: None)
+        cv2.createTrackbar("open", window_controls, cfg.detection.morph_open_ksize, 21, lambda _v: None)
+        cv2.createTrackbar("close", window_controls, cfg.detection.morph_close_ksize, 21, lambda _v: None)
+        if not simple:
+            cv2.createTrackbar("useAsp", window_controls, 1 if cfg.detection.use_aspect else 0, 1, lambda _v: None)
+            cv2.createTrackbar("aspMinX10", window_controls, int(cfg.detection.aspect_ratio_min * 10), 400, lambda _v: None)
+            cv2.createTrackbar("aspMaxX10", window_controls, int(cfg.detection.aspect_ratio_max * 10), 400, lambda _v: None)
+            cv2.createTrackbar("useLen", window_controls, 1 if cfg.detection.use_length else 0, 1, lambda _v: None)
+            cv2.createTrackbar("lenMinX10", window_controls, int(cfg.detection.length_min_cm * 10), 400, lambda _v: None)
+            cv2.createTrackbar("lenMaxX10", window_controls, int(cfg.detection.length_max_cm * 10), 400, lambda _v: None)
+            cv2.createTrackbar("useOri", window_controls, 1 if cfg.detection.use_orientation else 0, 1, lambda _v: None)
+            cv2.createTrackbar("angTol", window_controls, int(cfg.detection.angle_tolerance_deg), 90, lambda _v: None)
+            cv2.createTrackbar("clahe", window_controls, 1 if cfg.detection.use_clahe else 0, 1, lambda _v: None)
+            cv2.createTrackbar("clpX10", window_controls, int(cfg.detection.clahe_clip * 10), 50, lambda _v: None)
+            cv2.createTrackbar("grid", window_controls, int(cfg.detection.clahe_grid), 16, lambda _v: None)
+
+    if cfg.preview.show_controls:
+        build_controls(simple_controls)
 
     paused = False
     frame_idx = 0
@@ -531,6 +639,27 @@ def main() -> int:
             viz.update_fps()
         if frame is None:
             break
+
+        if cfg.preview.show_controls:
+            cfg.detection.mode = "contrast" if cv2.getTrackbarPos("mode 0=C 1=R", window_controls) == 0 else "red"
+            cfg.detection.diff_threshold = cv2.getTrackbarPos("thr", window_controls)
+            cfg.detection.blur_ksize = max(1, cv2.getTrackbarPos("blur", window_controls))
+            cfg.detection.morph_open_ksize = cv2.getTrackbarPos("open", window_controls)
+            cfg.detection.morph_close_ksize = cv2.getTrackbarPos("close", window_controls)
+            cfg.detection.min_area = cv2.getTrackbarPos("minA", window_controls)
+            cfg.detection.max_area = cv2.getTrackbarPos("maxA", window_controls)
+            if not simple_controls:
+                cfg.detection.use_aspect = cv2.getTrackbarPos("useAsp", window_controls) == 1
+                cfg.detection.aspect_ratio_min = cv2.getTrackbarPos("aspMinX10", window_controls) / 10.0
+                cfg.detection.aspect_ratio_max = cv2.getTrackbarPos("aspMaxX10", window_controls) / 10.0
+                cfg.detection.use_length = cv2.getTrackbarPos("useLen", window_controls) == 1
+                cfg.detection.length_min_cm = cv2.getTrackbarPos("lenMinX10", window_controls) / 10.0
+                cfg.detection.length_max_cm = cv2.getTrackbarPos("lenMaxX10", window_controls) / 10.0
+                cfg.detection.use_orientation = cv2.getTrackbarPos("useOri", window_controls) == 1
+                cfg.detection.angle_tolerance_deg = cv2.getTrackbarPos("angTol", window_controls)
+                cfg.detection.use_clahe = cv2.getTrackbarPos("clahe", window_controls) == 1
+                cfg.detection.clahe_clip = cv2.getTrackbarPos("clpX10", window_controls) / 10.0
+                cfg.detection.clahe_grid = max(2, cv2.getTrackbarPos("grid", window_controls))
 
         raw_vis = frame.copy()
         if cfg.roi.mode == "manual" and len(aligner.manual_points) > 0:
@@ -636,19 +765,20 @@ def main() -> int:
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for cnt in contours:
                 area = cv2.contourArea(cnt)
-                if area < cfg.detection.min_area or area > cfg.detection.max_area:
-                    continue
                 x, y, w, h = cv2.boundingRect(cnt)
                 if w == 0:
                     continue
-                if cfg.detection.use_aspect:
+                if not preview_all:
+                    if area < cfg.detection.min_area or area > cfg.detection.max_area:
+                        continue
+                if cfg.detection.use_aspect and not preview_all:
                     aspect = h / float(w)
                     if aspect < cfg.detection.aspect_ratio_min or aspect > cfg.detection.aspect_ratio_max:
                         continue
                 length_px = float(max(w, h))
                 px_per_cm = cfg.roi.warp_size / 40.0
                 length_cm = length_px / px_per_cm
-                if cfg.detection.use_length:
+                if cfg.detection.use_length and not preview_all:
                     if length_cm < cfg.detection.length_min_cm or length_cm > cfg.detection.length_max_cm:
                         continue
                 angle_deg = 90.0
@@ -657,45 +787,50 @@ def main() -> int:
                     _mean, eigenvectors = cv2.PCACompute(pts, mean=None)
                     vx, vy = eigenvectors[0]
                     angle_deg = float(np.degrees(np.arctan2(vy, vx)))
-                if cfg.detection.use_orientation and cfg.detection.orientation_mode == "vertical":
+                if cfg.detection.use_orientation and cfg.detection.orientation_mode == "vertical" and not preview_all:
                     angle_abs = abs((angle_deg + 90.0) % 180.0 - 90.0)
                     if angle_abs > cfg.detection.angle_tolerance_deg:
                         continue
                 cx = x + w / 2.0
                 cy = y + h / 2.0
-                blobs.append(
-                    Blob(
-                        contour=cnt,
-                        bbox=(x, y, w, h),
-                        area=area,
-                        centroid=(cx, cy),
-                        angle_deg=angle_deg,
-                        length_px=length_px,
+                if not preview_all:
+                    blobs.append(
+                        Blob(
+                            contour=cnt,
+                            bbox=(x, y, w, h),
+                            area=area,
+                            centroid=(cx, cy),
+                            angle_deg=angle_deg,
+                            length_px=length_px,
+                        )
                     )
-                )
-                cv2.rectangle(overlay_vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    cv2.rectangle(overlay_vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                else:
+                    cv2.rectangle(overlay_vis, (x, y), (x + w, y + h), (0, 255, 255), 1)
 
-        confirmed = tracker.update(blobs, frame_idx=frame_idx)
-        frame_idx += 1
-        for tr in confirmed:
-            print(
-                f"EVENT stroke_id={tr.track_id} centroid=({tr.centroid[0]:.1f},{tr.centroid[1]:.1f}) "
-                f"bbox={tr.bbox} angle={tr.angle_deg:.1f} length_px={tr.length_px:.1f}"
-            )
-            if cfg.freeze_mask.enabled and freeze_mask is not None:
-                x, y, w, h = tr.bbox
-                cv2.rectangle(freeze_mask, (x, y), (x + w, y + h), 255, -1)
-                dk = max(1, cfg.freeze_mask.dilate_ksize)
-                if dk % 2 == 0:
-                    dk += 1
-                if dk > 1:
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dk, dk))
-                    freeze_mask = cv2.dilate(freeze_mask, kernel)
+        confirmed = []
+        if not preview_all and not preview_only:
+            confirmed = tracker.update(blobs, frame_idx=frame_idx)
+            frame_idx += 1
+            for tr in confirmed:
+                print(
+                    f"EVENT stroke_id={tr.track_id} centroid=({tr.centroid[0]:.1f},{tr.centroid[1]:.1f}) "
+                    f"bbox={tr.bbox} angle={tr.angle_deg:.1f} length_px={tr.length_px:.1f}"
+                )
+                if cfg.freeze_mask.enabled and freeze_mask is not None:
+                    x, y, w, h = tr.bbox
+                    cv2.rectangle(freeze_mask, (x, y), (x + w, y + h), 255, -1)
+                    dk = max(1, cfg.freeze_mask.dilate_ksize)
+                    if dk % 2 == 0:
+                        dk += 1
+                    if dk > 1:
+                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dk, dk))
+                        freeze_mask = cv2.dilate(freeze_mask, kernel)
 
         if overlay_vis is not None:
             cv2.putText(
                 overlay_vis,
-                f"Count: {tracker.count} | Mode: {cfg.detection.mode}",
+                f"Count: {tracker.count} | Mode: {cfg.detection.mode} | PreviewAll: {'on' if preview_all else 'off'} | PreviewOnly: {'on' if preview_only else 'off'}",
                 (10, 24),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -708,6 +843,46 @@ def main() -> int:
                     continue
                 x, y, w, h = tr.bbox
                 cv2.rectangle(overlay_vis, (x, y), (x + w, y + h), (255, 255, 0), 2)
+            y0 = 48
+            step = 18
+            info_lines = [
+                f"thr={cfg.detection.diff_threshold} area={cfg.detection.min_area}-{cfg.detection.max_area}",
+                f"blur={cfg.detection.blur_ksize} open={cfg.detection.morph_open_ksize} close={cfg.detection.morph_close_ksize}",
+                f"aspect={'on' if cfg.detection.use_aspect else 'off'} len={'on' if cfg.detection.use_length else 'off'} orient={'on' if cfg.detection.use_orientation else 'off'}",
+                f"len_cm={cfg.detection.length_min_cm:.1f}-{cfg.detection.length_max_cm:.1f} angle_tol={cfg.detection.angle_tolerance_deg:.0f}",
+            ]
+            for line in info_lines:
+                cv2.putText(
+                    overlay_vis,
+                    line,
+                    (10, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 200, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                y0 += step
+            if help_overlay:
+                help_lines = [
+                    "Keys: b=baseline, c=clear pts, r=reset count, f=clear mask",
+                    "e=expert controls, h=toggle help, w=save config, a=preview all, t=preview only",
+                    "thr=diff threshold, minA/maxA=blob area",
+                    "blur/open/close=denoise controls",
+                    "asp/len/orient filters shown when expert on",
+                ]
+                for line in help_lines:
+                    cv2.putText(
+                        overlay_vis,
+                        line,
+                        (10, y0),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255, 255, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+                    y0 += step
 
         if cfg.preview.show_diff and not cfg.preview.mosaic:
             if diff_vis is None:
@@ -779,6 +954,29 @@ def main() -> int:
         if key == ord("f"):
             if freeze_mask is not None:
                 freeze_mask[:] = 0
+        if key == ord("w"):
+            save_config(config_path, cfg)
+            print("Config saved.")
+        if key == ord("h"):
+            help_overlay = not help_overlay
+        if key == ord("e"):
+            if cfg.preview.show_controls:
+                simple_controls = not simple_controls
+                cfg.preview.simple_controls = simple_controls
+                cv2.destroyWindow(window_controls)
+                build_controls(simple_controls)
+        if key == ord("a"):
+            preview_all = not preview_all
+            if preview_all:
+                preview_only = False
+                cfg.detection.preview_only = False
+            cfg.detection.preview_all = preview_all
+        if key == ord("t"):
+            preview_only = not preview_only
+            if preview_only:
+                preview_all = False
+                cfg.detection.preview_all = False
+            cfg.detection.preview_only = preview_only
 
     source.release()
     cv2.destroyAllWindows()
@@ -787,22 +985,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-    if cfg.preview.show_controls:
-        cfg.detection.mode = "contrast" if cv2.getTrackbarPos("mode 0=contrast 1=red", window_controls) == 0 else "red"
-        cfg.detection.diff_threshold = cv2.getTrackbarPos("diff_threshold", window_controls)
-        cfg.detection.blur_ksize = max(1, cv2.getTrackbarPos("blur_ksize", window_controls))
-        cfg.detection.morph_open_ksize = cv2.getTrackbarPos("morph_open", window_controls)
-        cfg.detection.morph_close_ksize = cv2.getTrackbarPos("morph_close", window_controls)
-        cfg.detection.min_area = cv2.getTrackbarPos("min_area", window_controls)
-        cfg.detection.max_area = cv2.getTrackbarPos("max_area", window_controls)
-        cfg.detection.use_aspect = cv2.getTrackbarPos("use_aspect", window_controls) == 1
-        cfg.detection.aspect_ratio_min = cv2.getTrackbarPos("aspect_min_x10", window_controls) / 10.0
-        cfg.detection.aspect_ratio_max = cv2.getTrackbarPos("aspect_max_x10", window_controls) / 10.0
-        cfg.detection.use_length = cv2.getTrackbarPos("use_length", window_controls) == 1
-        cfg.detection.length_min_cm = cv2.getTrackbarPos("len_min_x10", window_controls) / 10.0
-        cfg.detection.length_max_cm = cv2.getTrackbarPos("len_max_x10", window_controls) / 10.0
-        cfg.detection.use_orientation = cv2.getTrackbarPos("use_orient", window_controls) == 1
-        cfg.detection.angle_tolerance_deg = cv2.getTrackbarPos("angle_tol", window_controls)
-        cfg.detection.use_clahe = cv2.getTrackbarPos("clahe", window_controls) == 1
-        cfg.detection.clahe_clip = cv2.getTrackbarPos("clahe_clip_x10", window_controls) / 10.0
-        cfg.detection.clahe_grid = max(2, cv2.getTrackbarPos("clahe_grid", window_controls))

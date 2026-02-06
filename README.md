@@ -23,6 +23,11 @@ python main.py --config config.yaml
 - `b` capture baseline (Milestone 2)
 - `r` reset tracker/count (Milestone 4)
 - `f` clear freeze mask (Milestone 5)
+- `w` save current config to `config.yaml`
+- `h` toggle help overlay
+- `e` toggle expert controls
+- `a` toggle preview-all (show all changes, no counting)
+- `t` toggle preview-only (filtered preview, no counting)
 
 ## ROI Alignment
 
@@ -75,6 +80,13 @@ python main.py --config config.yaml
 
 - Enable `preview.show_controls: true` to get a controls window with trackbars.
 - Changes apply live without restarting.
+- If the controls feel too complex, set `preview.simple_controls: true`.
+- OpenCV trackbars do not support hover tooltips; the overlay includes live parameter readouts.
+
+## Mosaic ROI Input
+
+- In mosaic mode, manual ROI clicks are taken from the top-left quadrant (raw view).
+- Right-click in that quadrant clears points.
 
 ## Next Milestone
 

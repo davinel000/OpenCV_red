@@ -31,6 +31,8 @@ preview:
   mosaic: true
   # Show runtime controls window with trackbars
   show_controls: true
+  # Minimal controls (fewer sliders, simpler tuning)
+  simple_controls: false
 
 baseline:
   # Path to save/load baseline image (warped ROI)
@@ -43,6 +45,10 @@ baseline:
 detection:
   # "contrast" or "red"
   mode: "contrast"
+  # If true, only preview all changes (no counting, no freeze)
+  preview_all: false
+  # If true, preview filtered detections but do not count
+  preview_only: false
   blur_ksize: 5
   diff_threshold: 20 # 30
   morph_open_ksize: 3

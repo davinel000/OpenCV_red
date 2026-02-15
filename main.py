@@ -20,6 +20,8 @@ class CameraConfig:
     height: int
     fps: int
     video_file: Optional[str]
+    probe_max: int
+    auto_fallback: bool
 
 
 @dataclass
@@ -110,22 +112,35 @@ class AppConfig:
 class VideoSource:
     def __init__(self, cfg: CameraConfig) -> None:
         self.cfg = cfg
-        if cfg.video_file:
-            self.cap = cv2.VideoCapture(cfg.video_file)
+        self.cap = None
+        self.open(cfg.index)
+
+    def open(self, index: int) -> bool:
+        if self.cap is not None:
+            self.cap.release()
+        if self.cfg.video_file:
+            self.cap = cv2.VideoCapture(self.cfg.video_file)
         else:
-            self.cap = cv2.VideoCapture(cfg.index)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.height)
-        self.cap.set(cv2.CAP_PROP_FPS, cfg.fps)
+            self.cap = cv2.VideoCapture(index)
+        if not self.cap.isOpened():
+            return False
+        self.cfg.index = index
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.cfg.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.height)
+        self.cap.set(cv2.CAP_PROP_FPS, self.cfg.fps)
+        return True
 
     def read(self) -> Optional[np.ndarray]:
+        if self.cap is None:
+            return None
         ok, frame = self.cap.read()
         if not ok:
             return None
         return frame
 
     def release(self) -> None:
-        self.cap.release()
+        if self.cap is not None:
+            self.cap.release()
 
 
 class ROIAligner:
@@ -382,6 +397,8 @@ def load_config(path: Path) -> AppConfig:
             height=int(cam["height"]),
             fps=int(cam["fps"]),
             video_file=cam.get("video_file"),
+            probe_max=int(cam.get("probe_max", 4)),
+            auto_fallback=bool(cam.get("auto_fallback", True)),
         ),
         roi=ROIConfig(
             mode=str(roi["mode"]),
@@ -456,6 +473,8 @@ def save_config(path: Path, cfg: AppConfig) -> None:
             "height": cfg.camera.height,
             "fps": cfg.camera.fps,
             "video_file": cfg.camera.video_file,
+            "probe_max": cfg.camera.probe_max,
+            "auto_fallback": cfg.camera.auto_fallback,
         },
         "roi": {
             "mode": cfg.roi.mode,
@@ -608,8 +627,8 @@ def main() -> int:
         cv2.resizeWindow(window_controls, 420, 640)
         cv2.createTrackbar("mode 0=C 1=R", window_controls, 0 if cfg.detection.mode == "contrast" else 1, 1, lambda _v: None)
         cv2.createTrackbar("thr", window_controls, cfg.detection.diff_threshold, 255, lambda _v: None)
-        cv2.createTrackbar("minA", window_controls, cfg.detection.min_area, 200000, lambda _v: None)
-        cv2.createTrackbar("maxA", window_controls, cfg.detection.max_area, 200000, lambda _v: None)
+        cv2.createTrackbar("minA", window_controls, cfg.detection.min_area, 20000, lambda _v: None)
+        cv2.createTrackbar("maxA", window_controls, cfg.detection.max_area, 100000, lambda _v: None)
         cv2.createTrackbar("blur", window_controls, cfg.detection.blur_ksize, 25, lambda _v: None)
         cv2.createTrackbar("open", window_controls, cfg.detection.morph_open_ksize, 21, lambda _v: None)
         cv2.createTrackbar("close", window_controls, cfg.detection.morph_close_ksize, 21, lambda _v: None)
@@ -625,9 +644,25 @@ def main() -> int:
             cv2.createTrackbar("clahe", window_controls, 1 if cfg.detection.use_clahe else 0, 1, lambda _v: None)
             cv2.createTrackbar("clpX10", window_controls, int(cfg.detection.clahe_clip * 10), 50, lambda _v: None)
             cv2.createTrackbar("grid", window_controls, int(cfg.detection.clahe_grid), 16, lambda _v: None)
+            cv2.createTrackbar("matchD", window_controls, int(cfg.tracker.match_distance_px), 200, lambda _v: None)
+            cv2.createTrackbar("persist", window_controls, int(cfg.tracker.min_persist_frames), 30, lambda _v: None)
+            cv2.createTrackbar("cooldown", window_controls, int(cfg.tracker.cooldown_frames), 60, lambda _v: None)
 
     if cfg.preview.show_controls:
         build_controls(simple_controls)
+
+    def probe_cameras(max_index: int) -> List[int]:
+        available = []
+        for i in range(max_index + 1):
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                available.append(i)
+            cap.release()
+        return available
+
+    if cfg.camera.video_file is None:
+        cams = probe_cameras(cfg.camera.probe_max)
+        print(f"Available cameras (0..{cfg.camera.probe_max}): {cams}")
 
     paused = False
     frame_idx = 0
@@ -635,9 +670,33 @@ def main() -> int:
         if not paused:
             frame = source.read()
             if frame is None:
-                break
+                if cfg.camera.auto_fallback and cfg.camera.video_file is None:
+                    next_index = (cfg.camera.index + 1) % max(1, cfg.camera.probe_max + 1)
+                    ok = source.open(next_index)
+                    if ok:
+                        print(f"Switched to camera {next_index}")
+                        continue
+                print("Frame read failed. Press ]/[ to switch camera or q to quit.")
+                paused = True
+                frame = None
             viz.update_fps()
         if frame is None:
+            if paused:
+                key = cv2.waitKey(1) & 0xFF
+                if key in (27, ord("q")):
+                    break
+                if key == ord("]"):
+                    if source.open((cfg.camera.index + 1) % max(1, cfg.camera.probe_max + 1)):
+                        print(f"Switched to camera {cfg.camera.index}")
+                        paused = False
+                if key == ord("["):
+                    new_idx = cfg.camera.index - 1
+                    if new_idx < 0:
+                        new_idx = cfg.camera.probe_max
+                    if source.open(new_idx):
+                        print(f"Switched to camera {cfg.camera.index}")
+                        paused = False
+                continue
             break
 
         if cfg.preview.show_controls:
@@ -660,6 +719,9 @@ def main() -> int:
                 cfg.detection.use_clahe = cv2.getTrackbarPos("clahe", window_controls) == 1
                 cfg.detection.clahe_clip = cv2.getTrackbarPos("clpX10", window_controls) / 10.0
                 cfg.detection.clahe_grid = max(2, cv2.getTrackbarPos("grid", window_controls))
+                cfg.tracker.match_distance_px = max(1.0, float(cv2.getTrackbarPos("matchD", window_controls)))
+                cfg.tracker.min_persist_frames = max(1, cv2.getTrackbarPos("persist", window_controls))
+                cfg.tracker.cooldown_frames = max(0, cv2.getTrackbarPos("cooldown", window_controls))
 
         raw_vis = frame.copy()
         if cfg.roi.mode == "manual" and len(aligner.manual_points) > 0:
@@ -768,6 +830,8 @@ def main() -> int:
                 x, y, w, h = cv2.boundingRect(cnt)
                 if w == 0:
                     continue
+                if preview_all:
+                    cv2.rectangle(overlay_vis, (x, y), (x + w, y + h), (0, 255, 255), 1)
                 if not preview_all:
                     if area < cfg.detection.min_area or area > cfg.detection.max_area:
                         continue
@@ -805,10 +869,22 @@ def main() -> int:
                         )
                     )
                     cv2.rectangle(overlay_vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                else:
-                    cv2.rectangle(overlay_vis, (x, y), (x + w, y + h), (0, 255, 255), 1)
+                elif preview_only:
+                    blobs.append(
+                        Blob(
+                            contour=cnt,
+                            bbox=(x, y, w, h),
+                            area=area,
+                            centroid=(cx, cy),
+                            angle_deg=angle_deg,
+                            length_px=length_px,
+                        )
+                    )
+                    cv2.rectangle(overlay_vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
         confirmed = []
+        if preview_only:
+            tracker.reset()
         if not preview_all and not preview_only:
             confirmed = tracker.update(blobs, frame_idx=frame_idx)
             frame_idx += 1
@@ -867,9 +943,10 @@ def main() -> int:
                 help_lines = [
                     "Keys: b=baseline, c=clear pts, r=reset count, f=clear mask",
                     "e=expert controls, h=toggle help, w=save config, a=preview all, t=preview only",
+                    "[ / ] switch camera",
                     "thr=diff threshold, minA/maxA=blob area",
                     "blur/open/close=denoise controls",
-                    "asp/len/orient filters shown when expert on",
+                    "asp/len/orient + tracker controls shown when expert on",
                 ]
                 for line in help_lines:
                     cv2.putText(
@@ -977,6 +1054,17 @@ def main() -> int:
                 preview_all = False
                 cfg.detection.preview_all = False
             cfg.detection.preview_only = preview_only
+        if key == ord("]"):
+            if cfg.camera.video_file is None:
+                if source.open((cfg.camera.index + 1) % max(1, cfg.camera.probe_max + 1)):
+                    print(f"Switched to camera {cfg.camera.index}")
+        if key == ord("["):
+            if cfg.camera.video_file is None:
+                new_idx = cfg.camera.index - 1
+                if new_idx < 0:
+                    new_idx = cfg.camera.probe_max
+                if source.open(new_idx):
+                    print(f"Switched to camera {cfg.camera.index}")
 
     source.release()
     cv2.destroyAllWindows()

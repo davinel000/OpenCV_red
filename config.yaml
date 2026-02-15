@@ -1,23 +1,21 @@
 camera:
-  index: 1
-  width: 1280  
+  index: 2
+  width: 1280
   height: 720
   fps: 30
-  # Optional: set to a video file path for offline testing
   video_file: null
-
+  probe_max: 4
+  auto_fallback: true
 roi:
-  # "aruco" or "manual"
-  mode: "manual"
-  # Warp output size (square)
+  mode: manual
   warp_size: 1000
-  # Used only in aruco mode
-  aruco_dictionary: "DICT_4X4_50"
-  # Order matters: top-left, top-right, bottom-right, bottom-left
-  aruco_ids: [0, 1, 2, 3]
-  # Cache for manual 4-point selection
-  roi_cache_path: "roi_points.json"
-
+  aruco_dictionary: DICT_4X4_50
+  aruco_ids:
+  - 0
+  - 1
+  - 2
+  - 3
+  roi_cache_path: roi_points.json
 preview:
   show_raw: true
   show_warp: true
@@ -25,63 +23,46 @@ preview:
   show_diff: true
   show_mask: true
   show_overlay: true
-  # Initial size for each preview window (pixels)
   window_size: 500
-  # If true, show a single mosaic window instead of multiple windows
   mosaic: true
-  # Show runtime controls window with trackbars
   show_controls: true
-  # Minimal controls (fewer sliders, simpler tuning)
   simple_controls: false
-
 baseline:
-  # Path to save/load baseline image (warped ROI)
-  path: "baseline.png"
-  # Capture baseline as an average of N frames
+  path: baseline.png
   capture_frames: 30
-  # Delay between baseline capture frames (ms)
   capture_delay_ms: 10
-
 detection:
-  # "contrast" or "red"
-  mode: "contrast"
-  # If true, only preview all changes (no counting, no freeze)
+  mode: contrast
   preview_all: false
-  # If true, preview filtered detections but do not count
-  preview_only: false
-  blur_ksize: 5
-  diff_threshold: 20 # 30
+  preview_only: true
+  blur_ksize: 10
+  diff_threshold: 24
   morph_open_ksize: 3
-  morph_close_ksize: 3
-  # Illumination normalization (contrast mode)
+  morph_close_ksize: 21
   use_clahe: false
   clahe_clip: 2.0
-  clahe_grid: 8
-  min_area: 100 #200
-  max_area: 50000
-  use_aspect: false #true
-  aspect_ratio_min: 2.0
-  aspect_ratio_max: 20.0
-  use_length: false # true
-  # "vertical" or "any"
-  orientation_mode: "vertical"
-  use_orientation: true
-  angle_tolerance_deg: 25
-  length_min_cm: 2.0
-  length_max_cm: 7.0
-  # Red mode HSV thresholds (0-179 hue)
+  clahe_grid: 4
+  min_area: 0
+  max_area: 91635
+  use_aspect: true
+  aspect_ratio_min: 0.9
+  aspect_ratio_max: 40.0
+  use_length: true
+  orientation_mode: vertical
+  use_orientation: false
+  angle_tolerance_deg: 0
+  length_min_cm: 9.9
+  length_max_cm: 33.8
   red_hue_low1: 0
   red_hue_high1: 10
   red_hue_low2: 170
   red_hue_high2: 179
   red_sat_min: 80
   red_val_min: 50
-
 freeze_mask:
   enabled: true
   dilate_ksize: 5
-
 tracker:
-  match_distance_px: 40
-  min_persist_frames: 3
-  cooldown_frames: 10
+  match_distance_px: 62.0
+  min_persist_frames: 28
+  cooldown_frames: 55

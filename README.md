@@ -28,6 +28,7 @@ python main.py --config config.yaml
 - `e` toggle expert controls
 - `a` toggle preview-all (show all changes, no counting)
 - `t` toggle preview-only (filtered preview, no counting)
+- `[` / `]` switch camera index
 
 ## ROI Alignment
 
@@ -82,11 +83,17 @@ python main.py --config config.yaml
 - Changes apply live without restarting.
 - If the controls feel too complex, set `preview.simple_controls: true`.
 - OpenCV trackbars do not support hover tooltips; the overlay includes live parameter readouts.
+- Expert controls include tracker parameters: `matchD`, `persist`, `cooldown`.
 
 ## Mosaic ROI Input
 
 - In mosaic mode, manual ROI clicks are taken from the top-left quadrant (raw view).
 - Right-click in that quadrant clears points.
+
+## Camera Selection
+
+- Startup probes `0..camera.probe_max` and logs available indices.
+- Use `[` / `]` to switch cameras at runtime.
 
 ## Next Milestone
 

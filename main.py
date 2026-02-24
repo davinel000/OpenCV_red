@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import argparse
 import json
 import time
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -8,6 +11,17 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 import yaml
+try:
+    from pythonosc.dispatcher import Dispatcher
+    from pythonosc.osc_server import ThreadingOSCUDPServer
+    from pythonosc.udp_client import SimpleUDPClient
+
+    OSC_AVAILABLE = True
+except ImportError:
+    Dispatcher = None
+    ThreadingOSCUDPServer = None
+    SimpleUDPClient = None
+    OSC_AVAILABLE = False
 
 
 Point = Tuple[int, int]
@@ -99,6 +113,24 @@ class FreezeMaskConfig:
 
 
 @dataclass
+class ImageAdjustConfig:
+    brightness: int
+    contrast: float
+    highlights: int
+    shadows: int
+    flicker_strength: float
+
+
+@dataclass
+class OSCConfig:
+    enabled: bool
+    target_host: str
+    target_port: int
+    listen_host: str
+    listen_port: int
+
+
+@dataclass
 class AppConfig:
     camera: CameraConfig
     roi: ROIConfig
@@ -107,6 +139,8 @@ class AppConfig:
     detection: DetectionConfig
     tracker: TrackerConfig
     freeze_mask: FreezeMaskConfig
+    image_adjust: ImageAdjustConfig
+    osc: OSCConfig
 
 
 class VideoSource:
@@ -282,6 +316,401 @@ class BaselineManager:
         return True
 
 
+class ControlsWindow:
+    SIMPLE_TABS = ("general", "image", "osc")
+    EXPERT_TABS = ("general", "image", "advanced", "tracker", "osc")
+
+    def __init__(self, cfg: AppConfig, window_name: str) -> None:
+        self.cfg = cfg
+        self.window_name = window_name
+        self.simple_mode = cfg.preview.simple_controls
+        self.tab_index = 0
+        self._tabs = list(self.SIMPLE_TABS if self.simple_mode else self.EXPERT_TABS)
+        self.active_tab = self._tabs[0]
+        self.overlay_supported = True
+        self._build_window()
+
+    def _set_tabs(self) -> None:
+        self._tabs = list(self.SIMPLE_TABS if self.simple_mode else self.EXPERT_TABS)
+        if self.tab_index >= len(self._tabs):
+            self.tab_index = 0
+        self.active_tab = self._tabs[self.tab_index]
+
+    def _destroy_window(self) -> None:
+        try:
+            cv2.destroyWindow(self.window_name)
+        except cv2.error:
+            pass
+
+    def _build_window(self) -> None:
+        self._destroy_window()
+        self._set_tabs()
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.window_name, 420, 640)
+        self._show_overlay()
+        if self.active_tab == "general":
+            self._build_general()
+        elif self.active_tab == "image":
+            self._build_image()
+        elif self.active_tab == "advanced":
+            self._build_advanced()
+        elif self.active_tab == "tracker":
+            self._build_tracker()
+        elif self.active_tab == "osc":
+            self._build_osc()
+
+    def _show_overlay(self) -> None:
+        tabs_hint = ", ".join(f"{idx + 1}:{name}" for idx, name in enumerate(self._tabs))
+        mode = "expert" if not self.simple_mode else "simple"
+        msg = f"Controls tab: {self.active_tab} | Switch 1-{len(self._tabs)} | e toggles {mode}"
+        try:
+            cv2.displayOverlay(self.window_name, f"{msg}\nTabs: {tabs_hint}", 2000)
+        except cv2.error:
+            if self.overlay_supported:
+                print(f"[controls] {msg} | Tabs: {tabs_hint}")
+            self.overlay_supported = False
+
+    def toggle_simple(self) -> None:
+        self.simple_mode = not self.simple_mode
+        self.cfg.preview.simple_controls = self.simple_mode
+        self.tab_index = 0
+        self._build_window()
+
+    def select_tab(self, index: int) -> None:
+        if index < 0:
+            return
+        self._set_tabs()
+        if index >= len(self._tabs):
+            return
+        if self.tab_index == index:
+            return
+        self.tab_index = index
+        self.active_tab = self._tabs[self.tab_index]
+        self._build_window()
+
+    def _create(self, name: str, value: int, max_value: int) -> None:
+        cv2.createTrackbar(name, self.window_name, value, max_value, lambda _v: None)
+
+    def _build_general(self) -> None:
+        self._create("mode 0=C 1=R", 0 if self.cfg.detection.mode == "contrast" else 1, 1)
+        self._create("thr", self.cfg.detection.diff_threshold, 255)
+        self._create("minA", min(self.cfg.detection.min_area, 200000), 200000)
+        self._create("maxA", min(max(self.cfg.detection.max_area, self.cfg.detection.min_area), 200000), 200000)
+        self._create("blur", self.cfg.detection.blur_ksize, 31)
+        self._create("open", self.cfg.detection.morph_open_ksize, 31)
+        self._create("close", self.cfg.detection.morph_close_ksize, 61)
+
+    def _build_image(self) -> None:
+        self._create("bright(-100..100)", self.cfg.image_adjust.brightness + 100, 200)
+        contrast_slider = int(self.cfg.image_adjust.contrast * 100)
+        self._create("contrast(x0.01)", max(10, min(300, contrast_slider)), 300)
+        self._create("highlights(0..100)", max(0, self.cfg.image_adjust.highlights), 100)
+        self._create("shadows(0..100)", max(0, self.cfg.image_adjust.shadows), 100)
+        self._create("flicker%(0..100)", int(self.cfg.image_adjust.flicker_strength * 100), 100)
+
+    def _build_advanced(self) -> None:
+        self._create("useAsp", 1 if self.cfg.detection.use_aspect else 0, 1)
+        self._create("aspMinX10", int(self.cfg.detection.aspect_ratio_min * 10), 400)
+        self._create("aspMaxX10", int(self.cfg.detection.aspect_ratio_max * 10), 400)
+        self._create("useLen", 1 if self.cfg.detection.use_length else 0, 1)
+        self._create("lenMinX10", int(self.cfg.detection.length_min_cm * 10), 400)
+        self._create("lenMaxX10", int(self.cfg.detection.length_max_cm * 10), 400)
+        self._create("useOri", 1 if self.cfg.detection.use_orientation else 0, 1)
+        self._create("angTol", int(self.cfg.detection.angle_tolerance_deg), 90)
+        self._create("clahe", 1 if self.cfg.detection.use_clahe else 0, 1)
+        self._create("clpX10", int(self.cfg.detection.clahe_clip * 10), 50)
+        self._create("grid", max(2, self.cfg.detection.clahe_grid), 32)
+
+    def _build_tracker(self) -> None:
+        self._create("matchD", int(self.cfg.tracker.match_distance_px), 400)
+        self._create("persist", int(self.cfg.tracker.min_persist_frames), 120)
+        self._create("cooldown", int(self.cfg.tracker.cooldown_frames), 240)
+        self._create("freezeMask", 1 if self.cfg.freeze_mask.enabled else 0, 1)
+        self._create("freezeDil", int(self.cfg.freeze_mask.dilate_ksize), 51)
+
+    @staticmethod
+    def _split_ip(addr: str) -> Tuple[int, int, int, int]:
+        try:
+            parts = [int(x) for x in addr.split(".")]
+            if len(parts) != 4:
+                raise ValueError()
+        except Exception:
+            return (127, 0, 0, 1)
+        return tuple(max(0, min(255, p)) for p in parts)
+
+    def _build_osc(self) -> None:
+        self._create("oscEnabled", 1 if self.cfg.osc.enabled else 0, 1)
+        a, b, c, d = self._split_ip(self.cfg.osc.target_host)
+        self._create("destA", a, 255)
+        self._create("destB", b, 255)
+        self._create("destC", c, 255)
+        self._create("destD", d, 255)
+        self._create("destPort", self.cfg.osc.target_port, 65535)
+        la, lb, lc, ld = self._split_ip(self.cfg.osc.listen_host)
+        self._create("listenA", la, 255)
+        self._create("listenB", lb, 255)
+        self._create("listenC", lc, 255)
+        self._create("listenD", ld, 255)
+        self._create("listenPort", self.cfg.osc.listen_port, 65535)
+
+    def _read_general(self) -> None:
+        self.cfg.detection.mode = "contrast" if cv2.getTrackbarPos("mode 0=C 1=R", self.window_name) == 0 else "red"
+        self.cfg.detection.diff_threshold = cv2.getTrackbarPos("thr", self.window_name)
+        self.cfg.detection.min_area = cv2.getTrackbarPos("minA", self.window_name)
+        self.cfg.detection.max_area = max(self.cfg.detection.min_area, cv2.getTrackbarPos("maxA", self.window_name))
+        blur = max(1, cv2.getTrackbarPos("blur", self.window_name))
+        if blur % 2 == 0:
+            blur += 1
+        self.cfg.detection.blur_ksize = blur
+        self.cfg.detection.morph_open_ksize = cv2.getTrackbarPos("open", self.window_name)
+        self.cfg.detection.morph_close_ksize = cv2.getTrackbarPos("close", self.window_name)
+
+    def _read_image(self) -> None:
+        self.cfg.image_adjust.brightness = cv2.getTrackbarPos("bright(-100..100)", self.window_name) - 100
+        contrast_raw = cv2.getTrackbarPos("contrast(x0.01)", self.window_name)
+        self.cfg.image_adjust.contrast = max(0.1, contrast_raw / 100.0)
+        self.cfg.image_adjust.highlights = cv2.getTrackbarPos("highlights(0..100)", self.window_name)
+        self.cfg.image_adjust.shadows = cv2.getTrackbarPos("shadows(0..100)", self.window_name)
+        self.cfg.image_adjust.flicker_strength = cv2.getTrackbarPos("flicker%(0..100)", self.window_name) / 100.0
+
+    def _read_advanced(self) -> None:
+        self.cfg.detection.use_aspect = cv2.getTrackbarPos("useAsp", self.window_name) == 1
+        self.cfg.detection.aspect_ratio_min = cv2.getTrackbarPos("aspMinX10", self.window_name) / 10.0
+        self.cfg.detection.aspect_ratio_max = max(
+            self.cfg.detection.aspect_ratio_min,
+            cv2.getTrackbarPos("aspMaxX10", self.window_name) / 10.0,
+        )
+        self.cfg.detection.use_length = cv2.getTrackbarPos("useLen", self.window_name) == 1
+        self.cfg.detection.length_min_cm = cv2.getTrackbarPos("lenMinX10", self.window_name) / 10.0
+        self.cfg.detection.length_max_cm = max(
+            self.cfg.detection.length_min_cm,
+            cv2.getTrackbarPos("lenMaxX10", self.window_name) / 10.0,
+        )
+        self.cfg.detection.use_orientation = cv2.getTrackbarPos("useOri", self.window_name) == 1
+        self.cfg.detection.angle_tolerance_deg = cv2.getTrackbarPos("angTol", self.window_name)
+        self.cfg.detection.use_clahe = cv2.getTrackbarPos("clahe", self.window_name) == 1
+        self.cfg.detection.clahe_clip = max(0.1, cv2.getTrackbarPos("clpX10", self.window_name) / 10.0)
+        self.cfg.detection.clahe_grid = max(2, cv2.getTrackbarPos("grid", self.window_name))
+
+    def _read_tracker(self) -> None:
+        self.cfg.tracker.match_distance_px = max(1.0, float(cv2.getTrackbarPos("matchD", self.window_name)))
+        self.cfg.tracker.min_persist_frames = max(1, cv2.getTrackbarPos("persist", self.window_name))
+        self.cfg.tracker.cooldown_frames = max(0, cv2.getTrackbarPos("cooldown", self.window_name))
+        self.cfg.freeze_mask.enabled = cv2.getTrackbarPos("freezeMask", self.window_name) == 1
+        self.cfg.freeze_mask.dilate_ksize = max(1, cv2.getTrackbarPos("freezeDil", self.window_name))
+
+    def _read_osc(self) -> None:
+        self.cfg.osc.enabled = cv2.getTrackbarPos("oscEnabled", self.window_name) == 1
+
+        def _addr(prefix: str) -> str:
+            parts = [
+                cv2.getTrackbarPos(f"{prefix}A", self.window_name),
+                cv2.getTrackbarPos(f"{prefix}B", self.window_name),
+                cv2.getTrackbarPos(f"{prefix}C", self.window_name),
+                cv2.getTrackbarPos(f"{prefix}D", self.window_name),
+            ]
+            return ".".join(str(p) for p in parts)
+
+        self.cfg.osc.target_host = _addr("dest")
+        self.cfg.osc.target_port = cv2.getTrackbarPos("destPort", self.window_name)
+        self.cfg.osc.listen_host = _addr("listen")
+        self.cfg.osc.listen_port = cv2.getTrackbarPos("listenPort", self.window_name)
+
+    def apply(self) -> None:
+        if self.active_tab == "general":
+            self._read_general()
+        elif self.active_tab == "image":
+            self._read_image()
+        elif self.active_tab == "advanced":
+            self._read_advanced()
+        elif self.active_tab == "tracker":
+            self._read_tracker()
+        elif self.active_tab == "osc":
+            self._read_osc()
+
+
+class ImageAdjuster:
+    def __init__(self, cfg: ImageAdjustConfig) -> None:
+        self.cfg = cfg
+        self.temporal_state: Optional[np.ndarray] = None
+
+    def reset_temporal(self) -> None:
+        self.temporal_state = None
+
+    def _apply_tone_curves(self, img: np.ndarray) -> np.ndarray:
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        L, a, b = cv2.split(lab)
+        Lf = L.astype(np.float32)
+        if self.cfg.shadows > 0:
+            shadow_amt = min(1.0, self.cfg.shadows / 100.0)
+            mask = Lf < 128.0
+            Lf[mask] += shadow_amt * (128.0 - Lf[mask])
+        if self.cfg.highlights > 0:
+            highlight_amt = min(1.0, self.cfg.highlights / 100.0)
+            mask = Lf > 128.0
+            Lf[mask] -= highlight_amt * (Lf[mask] - 128.0)
+        L = np.clip(Lf, 0, 255).astype(np.uint8)
+        lab = cv2.merge([L, a, b])
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    def apply(self, frame: np.ndarray, apply_temporal: bool = True) -> np.ndarray:
+        if frame is None:
+            return frame
+        img = frame.astype(np.float32)
+        alpha = max(0.1, min(5.0, float(self.cfg.contrast)))
+        beta = float(np.clip(self.cfg.brightness, -255, 255))
+        img = img * alpha + beta
+        img = np.clip(img, 0, 255).astype(np.uint8)
+        img = self._apply_tone_curves(img)
+        strength = float(np.clip(self.cfg.flicker_strength, 0.0, 1.0))
+        if not apply_temporal:
+            return img
+        if strength <= 0.0:
+            self.temporal_state = None
+            return img
+        current = img.astype(np.float32)
+        if self.temporal_state is None or self.temporal_state.shape != current.shape:
+            self.temporal_state = current.copy()
+        else:
+            alpha_t = max(0.01, 1.0 - strength)
+            self.temporal_state = (1.0 - alpha_t) * self.temporal_state + alpha_t * current
+        return self.temporal_state.astype(np.uint8)
+
+
+class OSCBridge:
+    def __init__(self, cfg: OSCConfig) -> None:
+        self.cfg = cfg
+        self.client: Optional[SimpleUDPClient] = None
+        self.server: Optional[ThreadingOSCUDPServer] = None
+        self.server_thread: Optional[threading.Thread] = None
+        self.dispatcher = None
+        self._applied_cfg: Optional[Tuple[bool, str, int, str, int]] = None
+        self.pending_pause: Optional[bool] = None
+        self.toggle_request = False
+        self._lock = threading.Lock()
+        self.refresh(force=True)
+
+    def _config_tuple(self) -> Tuple[bool, str, int, str, int]:
+        return (
+            bool(self.cfg.enabled),
+            self.cfg.target_host,
+            int(self.cfg.target_port),
+            self.cfg.listen_host,
+            int(self.cfg.listen_port),
+        )
+
+    def refresh(self, force: bool = False) -> None:
+        cfg_tuple = self._config_tuple()
+        if not force and cfg_tuple == self._applied_cfg:
+            return
+        self._applied_cfg = cfg_tuple
+        self.shutdown()
+        if not self.cfg.enabled:
+            return
+        if not OSC_AVAILABLE:
+            print("python-osc not installed; OSC disabled.")
+            return
+        try:
+            self.client = SimpleUDPClient(self.cfg.target_host, self.cfg.target_port)
+            print(f"OSC sending to {self.cfg.target_host}:{self.cfg.target_port}")
+        except Exception as exc:
+            print(f"OSC client error: {exc}")
+            self.client = None
+        try:
+            dispatcher = Dispatcher()
+            dispatcher.map("/control/pause", self._handle_pause)
+            dispatcher.map("/control/toggle_pause", self._handle_toggle_pause)
+            server = ThreadingOSCUDPServer((self.cfg.listen_host, self.cfg.listen_port), dispatcher)
+            self.dispatcher = dispatcher
+            self.server = server
+            self.server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            self.server_thread.start()
+            print(f"OSC listening on {self.cfg.listen_host}:{self.cfg.listen_port}")
+        except Exception as exc:
+            print(f"OSC server error: {exc}")
+            self.dispatcher = None
+            self.server = None
+            self.server_thread = None
+
+    def shutdown(self) -> None:
+        if self.server is not None:
+            try:
+                self.server.shutdown()
+                self.server.server_close()
+            except Exception:
+                pass
+        self.server = None
+        self.server_thread = None
+        self.dispatcher = None
+        self.client = None
+
+    def _handle_pause(self, _addr, *args) -> None:
+        value = True
+        if args:
+            try:
+                value = bool(args[0])
+            except Exception:
+                value = True
+        with self._lock:
+            self.pending_pause = value
+
+    def _handle_toggle_pause(self, _addr, *args) -> None:
+        with self._lock:
+            self.toggle_request = True
+
+    def consume_pause(self) -> Optional[bool]:
+        with self._lock:
+            value = self.pending_pause
+            self.pending_pause = None
+            return value
+
+    def consume_toggle(self) -> bool:
+        with self._lock:
+            if self.toggle_request:
+                self.toggle_request = False
+                return True
+        return False
+
+    def send_stroke_event(self, track: Track, total_count: int) -> None:
+        if self.client is None:
+            return
+        payload = [
+            int(track.track_id),
+            float(track.centroid[0]),
+            float(track.centroid[1]),
+            float(track.length_px),
+            float(track.angle_deg),
+            int(total_count),
+        ]
+        try:
+            self.client.send_message("/events/stroke", payload)
+        except Exception as exc:
+            print(f"OSC stroke send failed: {exc}")
+
+    def send_count(self, count: int) -> bool:
+        if self.client is None:
+            return False
+        try:
+            self.client.send_message("/state/count", int(count))
+            return True
+        except Exception as exc:
+            print(f"OSC count send failed: {exc}")
+            return False
+
+    def send_test_event(self, count: int) -> bool:
+        if self.client is None:
+            print("OSC test send skipped: client not connected.")
+            return False
+        try:
+            self.client.send_message("/events/stroke", [0, 0.0, 0.0, 0.0, 0.0, int(count)])
+            self.client.send_message("/state/count", int(count))
+            print("OSC test messages sent (/events/stroke, /state/count).")
+            return True
+        except Exception as exc:
+            print(f"OSC test send failed: {exc}")
+            return False
+
+
 @dataclass
 class Blob:
     contour: np.ndarray
@@ -390,6 +819,8 @@ def load_config(path: Path) -> AppConfig:
     detection = data["detection"]
     tracker = data["tracker"]
     freeze_mask = data["freeze_mask"]
+    image_adjust = data.get("image_adjust", {})
+    osc = data.get("osc", {})
     return AppConfig(
         camera=CameraConfig(
             index=int(cam["index"]),
@@ -461,6 +892,20 @@ def load_config(path: Path) -> AppConfig:
         freeze_mask=FreezeMaskConfig(
             enabled=bool(freeze_mask["enabled"]),
             dilate_ksize=int(freeze_mask["dilate_ksize"]),
+        ),
+        image_adjust=ImageAdjustConfig(
+            brightness=int(image_adjust.get("brightness", 0)),
+            contrast=float(image_adjust.get("contrast", 1.0)),
+            highlights=int(image_adjust.get("highlights", 0)),
+            shadows=int(image_adjust.get("shadows", 0)),
+            flicker_strength=float(image_adjust.get("flicker_strength", 0.0)),
+        ),
+        osc=OSCConfig(
+            enabled=bool(osc.get("enabled", False)),
+            target_host=str(osc.get("target_host", "127.0.0.1")),
+            target_port=int(osc.get("target_port", 9000)),
+            listen_host=str(osc.get("listen_host", "0.0.0.0")),
+            listen_port=int(osc.get("listen_port", 9001)),
         ),
     )
 
@@ -538,6 +983,20 @@ def save_config(path: Path, cfg: AppConfig) -> None:
             "min_persist_frames": cfg.tracker.min_persist_frames,
             "cooldown_frames": cfg.tracker.cooldown_frames,
         },
+        "image_adjust": {
+            "brightness": cfg.image_adjust.brightness,
+            "contrast": cfg.image_adjust.contrast,
+            "highlights": cfg.image_adjust.highlights,
+            "shadows": cfg.image_adjust.shadows,
+            "flicker_strength": cfg.image_adjust.flicker_strength,
+        },
+        "osc": {
+            "enabled": cfg.osc.enabled,
+            "target_host": cfg.osc.target_host,
+            "target_port": cfg.osc.target_port,
+            "listen_host": cfg.osc.listen_host,
+            "listen_port": cfg.osc.listen_port,
+        },
     }
     path.write_text(yaml.safe_dump(data, sort_keys=False))
 
@@ -553,12 +1012,15 @@ def main() -> int:
     aligner = ROIAligner(cfg.roi)
     viz = Visualizer(cfg.preview)
     baseline_mgr = BaselineManager(cfg.baseline)
+    image_adjuster = ImageAdjuster(cfg.image_adjust)
     tracker = StrokeTracker(cfg.tracker)
+    osc_bridge = OSCBridge(cfg.osc)
     freeze_mask = None
-    simple_controls = cfg.preview.simple_controls
     help_overlay = True
     preview_all = cfg.detection.preview_all
     preview_only = cfg.detection.preview_only
+    last_sent_count = tracker.count
+    osc_bridge.send_count(tracker.count)
 
     window_raw = "raw"
     window_warp = "warp"
@@ -622,34 +1084,9 @@ def main() -> int:
     else:
         cv2.resizeWindow(window_mosaic, cfg.preview.window_size * 2, cfg.preview.window_size * 2)
 
-    def build_controls(simple: bool) -> None:
-        cv2.namedWindow(window_controls, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_controls, 420, 640)
-        cv2.createTrackbar("mode 0=C 1=R", window_controls, 0 if cfg.detection.mode == "contrast" else 1, 1, lambda _v: None)
-        cv2.createTrackbar("thr", window_controls, cfg.detection.diff_threshold, 255, lambda _v: None)
-        cv2.createTrackbar("minA", window_controls, cfg.detection.min_area, 20000, lambda _v: None)
-        cv2.createTrackbar("maxA", window_controls, cfg.detection.max_area, 100000, lambda _v: None)
-        cv2.createTrackbar("blur", window_controls, cfg.detection.blur_ksize, 25, lambda _v: None)
-        cv2.createTrackbar("open", window_controls, cfg.detection.morph_open_ksize, 21, lambda _v: None)
-        cv2.createTrackbar("close", window_controls, cfg.detection.morph_close_ksize, 21, lambda _v: None)
-        if not simple:
-            cv2.createTrackbar("useAsp", window_controls, 1 if cfg.detection.use_aspect else 0, 1, lambda _v: None)
-            cv2.createTrackbar("aspMinX10", window_controls, int(cfg.detection.aspect_ratio_min * 10), 400, lambda _v: None)
-            cv2.createTrackbar("aspMaxX10", window_controls, int(cfg.detection.aspect_ratio_max * 10), 400, lambda _v: None)
-            cv2.createTrackbar("useLen", window_controls, 1 if cfg.detection.use_length else 0, 1, lambda _v: None)
-            cv2.createTrackbar("lenMinX10", window_controls, int(cfg.detection.length_min_cm * 10), 400, lambda _v: None)
-            cv2.createTrackbar("lenMaxX10", window_controls, int(cfg.detection.length_max_cm * 10), 400, lambda _v: None)
-            cv2.createTrackbar("useOri", window_controls, 1 if cfg.detection.use_orientation else 0, 1, lambda _v: None)
-            cv2.createTrackbar("angTol", window_controls, int(cfg.detection.angle_tolerance_deg), 90, lambda _v: None)
-            cv2.createTrackbar("clahe", window_controls, 1 if cfg.detection.use_clahe else 0, 1, lambda _v: None)
-            cv2.createTrackbar("clpX10", window_controls, int(cfg.detection.clahe_clip * 10), 50, lambda _v: None)
-            cv2.createTrackbar("grid", window_controls, int(cfg.detection.clahe_grid), 16, lambda _v: None)
-            cv2.createTrackbar("matchD", window_controls, int(cfg.tracker.match_distance_px), 200, lambda _v: None)
-            cv2.createTrackbar("persist", window_controls, int(cfg.tracker.min_persist_frames), 30, lambda _v: None)
-            cv2.createTrackbar("cooldown", window_controls, int(cfg.tracker.cooldown_frames), 60, lambda _v: None)
-
+    controls_ui = None
     if cfg.preview.show_controls:
-        build_controls(simple_controls)
+        controls_ui = ControlsWindow(cfg, window_controls)
 
     def probe_cameras(max_index: int) -> List[int]:
         available = []
@@ -680,6 +1117,18 @@ def main() -> int:
                 paused = True
                 frame = None
             viz.update_fps()
+        if controls_ui is not None:
+            controls_ui.apply()
+        osc_bridge.refresh()
+        pause_cmd = osc_bridge.consume_pause()
+        if pause_cmd is not None:
+            paused = pause_cmd
+            state = "paused" if paused else "running"
+            print(f"OSC pause -> {state}")
+        if osc_bridge.consume_toggle():
+            paused = not paused
+            state = "paused" if paused else "running"
+            print(f"OSC toggle -> {state}")
         if frame is None:
             if paused:
                 key = cv2.waitKey(1) & 0xFF
@@ -699,30 +1148,6 @@ def main() -> int:
                 continue
             break
 
-        if cfg.preview.show_controls:
-            cfg.detection.mode = "contrast" if cv2.getTrackbarPos("mode 0=C 1=R", window_controls) == 0 else "red"
-            cfg.detection.diff_threshold = cv2.getTrackbarPos("thr", window_controls)
-            cfg.detection.blur_ksize = max(1, cv2.getTrackbarPos("blur", window_controls))
-            cfg.detection.morph_open_ksize = cv2.getTrackbarPos("open", window_controls)
-            cfg.detection.morph_close_ksize = cv2.getTrackbarPos("close", window_controls)
-            cfg.detection.min_area = cv2.getTrackbarPos("minA", window_controls)
-            cfg.detection.max_area = cv2.getTrackbarPos("maxA", window_controls)
-            if not simple_controls:
-                cfg.detection.use_aspect = cv2.getTrackbarPos("useAsp", window_controls) == 1
-                cfg.detection.aspect_ratio_min = cv2.getTrackbarPos("aspMinX10", window_controls) / 10.0
-                cfg.detection.aspect_ratio_max = cv2.getTrackbarPos("aspMaxX10", window_controls) / 10.0
-                cfg.detection.use_length = cv2.getTrackbarPos("useLen", window_controls) == 1
-                cfg.detection.length_min_cm = cv2.getTrackbarPos("lenMinX10", window_controls) / 10.0
-                cfg.detection.length_max_cm = cv2.getTrackbarPos("lenMaxX10", window_controls) / 10.0
-                cfg.detection.use_orientation = cv2.getTrackbarPos("useOri", window_controls) == 1
-                cfg.detection.angle_tolerance_deg = cv2.getTrackbarPos("angTol", window_controls)
-                cfg.detection.use_clahe = cv2.getTrackbarPos("clahe", window_controls) == 1
-                cfg.detection.clahe_clip = cv2.getTrackbarPos("clpX10", window_controls) / 10.0
-                cfg.detection.clahe_grid = max(2, cv2.getTrackbarPos("grid", window_controls))
-                cfg.tracker.match_distance_px = max(1.0, float(cv2.getTrackbarPos("matchD", window_controls)))
-                cfg.tracker.min_persist_frames = max(1, cv2.getTrackbarPos("persist", window_controls))
-                cfg.tracker.cooldown_frames = max(0, cv2.getTrackbarPos("cooldown", window_controls))
-
         raw_vis = frame.copy()
         if cfg.roi.mode == "manual" and len(aligner.manual_points) > 0:
             for pt in aligner.manual_points:
@@ -730,6 +1155,8 @@ def main() -> int:
         viz.draw_fps(raw_vis)
 
         warped, _H = aligner.get_warp(frame)
+        if warped is not None:
+            warped = image_adjuster.apply(warped, apply_temporal=True)
 
         if cfg.preview.show_raw:
             cv2.imshow(window_raw, raw_vis)
@@ -758,6 +1185,7 @@ def main() -> int:
         overlay_vis = None
         blobs: List[Blob] = []
         if warped is not None and baseline_mgr.baseline is not None:
+            base_adjusted = image_adjuster.apply(baseline_mgr.baseline, apply_temporal=False)
             if freeze_mask is None or freeze_mask.shape[:2] != warped.shape[:2]:
                 freeze_mask = np.zeros(warped.shape[:2], dtype=np.uint8)
 
@@ -767,7 +1195,7 @@ def main() -> int:
 
             if cfg.detection.mode == "red":
                 hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
-                hsv_base = cv2.cvtColor(baseline_mgr.baseline, cv2.COLOR_BGR2HSV)
+                hsv_base = cv2.cvtColor(base_adjusted, cv2.COLOR_BGR2HSV)
                 mask1 = cv2.inRange(
                     hsv,
                     (cfg.detection.red_hue_low1, cfg.detection.red_sat_min, cfg.detection.red_val_min),
@@ -794,7 +1222,7 @@ def main() -> int:
                 diff_vis = mask.copy()
             else:
                 gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-                base_gray = cv2.cvtColor(baseline_mgr.baseline, cv2.COLOR_BGR2GRAY)
+                base_gray = cv2.cvtColor(base_adjusted, cv2.COLOR_BGR2GRAY)
                 if k > 1:
                     gray = cv2.GaussianBlur(gray, (k, k), 0)
                     base_gray = cv2.GaussianBlur(base_gray, (k, k), 0)
@@ -893,6 +1321,7 @@ def main() -> int:
                     f"EVENT stroke_id={tr.track_id} centroid=({tr.centroid[0]:.1f},{tr.centroid[1]:.1f}) "
                     f"bbox={tr.bbox} angle={tr.angle_deg:.1f} length_px={tr.length_px:.1f}"
                 )
+                osc_bridge.send_stroke_event(tr, tracker.count)
                 if cfg.freeze_mask.enabled and freeze_mask is not None:
                     x, y, w, h = tr.bbox
                     cv2.rectangle(freeze_mask, (x, y), (x + w, y + h), 255, -1)
@@ -941,12 +1370,13 @@ def main() -> int:
                 y0 += step
             if help_overlay:
                 help_lines = [
-                    "Keys: b=baseline, c=clear pts, r=reset count, f=clear mask",
-                    "e=expert controls, h=toggle help, w=save config, a=preview all, t=preview only",
+                    "Keys: b baseline, c clear ROI, r reset count, f clear mask, p pause",
+                    "e toggles simple/expert tabs, 1-5 select tab, h help, w save, a previewAll, t previewOnly",
                     "[ / ] switch camera",
-                    "thr=diff threshold, minA/maxA=blob area",
-                    "blur/open/close=denoise controls",
-                    "asp/len/orient + tracker controls shown when expert on",
+                    "General tab: mode, thr, area, blur/open/close",
+                    "Advanced tab: aspect/length/orient + CLAHE (expert)",
+                    "Image tab: brightness/contrast/highlights/shadows/flicker | OSC tab: enable + host/ports",
+                    "o sends OSC test event (/events/stroke + /state/count)",
                 ]
                 for line in help_lines:
                     cv2.putText(
@@ -1004,6 +1434,10 @@ def main() -> int:
             mosaic = cv2.vconcat([top, bottom])
             cv2.imshow(window_mosaic, mosaic)
 
+        if tracker.count != last_sent_count:
+            osc_bridge.send_count(tracker.count)
+            last_sent_count = tracker.count
+
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord("q")):
             break
@@ -1024,6 +1458,7 @@ def main() -> int:
                     print("Baseline captured and saved.")
                     if freeze_mask is not None:
                         freeze_mask[:] = 0
+                    image_adjuster.reset_temporal()
                 else:
                     print("Baseline capture failed.")
         if key == ord("r"):
@@ -1036,12 +1471,14 @@ def main() -> int:
             print("Config saved.")
         if key == ord("h"):
             help_overlay = not help_overlay
+        if key == ord("o"):
+            osc_bridge.send_test_event(tracker.count)
         if key == ord("e"):
-            if cfg.preview.show_controls:
-                simple_controls = not simple_controls
-                cfg.preview.simple_controls = simple_controls
-                cv2.destroyWindow(window_controls)
-                build_controls(simple_controls)
+            if controls_ui is not None:
+                controls_ui.toggle_simple()
+        if key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5")):
+            if controls_ui is not None:
+                controls_ui.select_tab(key - ord("1"))
         if key == ord("a"):
             preview_all = not preview_all
             if preview_all:
@@ -1067,6 +1504,7 @@ def main() -> int:
                     print(f"Switched to camera {cfg.camera.index}")
 
     source.release()
+    osc_bridge.shutdown()
     cv2.destroyAllWindows()
     return 0
 

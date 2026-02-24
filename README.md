@@ -26,9 +26,19 @@ python main.py --config config.yaml
 - `w` save current config to `config.yaml`
 - `h` toggle help overlay
 - `e` toggle expert controls
+- `1`..`5` switch tabs inside the controls window (General, Image, Advanced, Tracker, OSC)
+- `o` send an OSC test pulse (fires `/events/stroke` with dummy data and `/state/count`)
 - `a` toggle preview-all (show all changes, no counting)
 - `t` toggle preview-only (filtered preview, no counting)
 - `[` / `]` switch camera index
+
+### Tabbed controls
+
+- **General** – detection mode, thresholds, blur/open/close, area limits.
+- **Image** – brightness, contrast, highlights, shadows, and flicker compensation for the warped ROI before detection.
+- **Advanced** *(expert)* – aspect/length/orientation filters plus CLAHE settings.
+- **Tracker** *(expert)* – tracker distance/persist/cooldown plus freeze mask enable/dilate controls.
+- **OSC** – toggle OSC, remote host and listen address/port (IPs are entered per-octet).
 
 ## ROI Alignment
 
@@ -80,10 +90,9 @@ python main.py --config config.yaml
 ## Runtime Tuning
 
 - Enable `preview.show_controls: true` to get a controls window with trackbars.
+- Tabs keep parameters compact; press `e` to switch between simple (General/Image/OSC) and expert (all tabs).
 - Changes apply live without restarting.
-- If the controls feel too complex, set `preview.simple_controls: true`.
 - OpenCV trackbars do not support hover tooltips; the overlay includes live parameter readouts.
-- Expert controls include tracker parameters: `matchD`, `persist`, `cooldown`.
 
 ## Mosaic ROI Input
 
@@ -98,3 +107,30 @@ python main.py --config config.yaml
 ## Next Milestone
 
 Milestone 3 will add contrast-mode diff, mask, blob detection, and overlay.
+
+## Image Adjustments
+
+Section `image_adjust` in `config.yaml` (and the “Image” tab at runtime) controls pre-processing of the warped ROI and the baseline before differencing:
+
+- `brightness` (`-100..100`) and `contrast` (0.1..3.0×) are applied first.
+- `highlights` reduces clipping in bright regions, `shadows` lifts darker tones.
+- `flicker_strength` (0..100%) applies an exponential moving average to tame LED striping; higher values smooth more aggressively.
+
+These adjustments affect both the live ROI and the cached baseline so detection stays consistent.
+
+## OSC Integration
+
+Set up the `osc` section (or use the OSC tab) to drive integrations:
+
+- `enabled`: turn OSC on/off without restarting.
+- `target_host` / `target_port`: where events are sent (`/events/stroke` and `/state/count` messages).
+- `listen_host` / `listen_port`: where the app listens for control commands.
+
+Messages:
+
+- Outgoing `/events/stroke` → `[track_id, centroid_x, centroid_y, length_px, angle_deg, total_count]`.
+- Outgoing `/state/count` → `[total_count]`, sent whenever the count changes.
+- Incoming `/control/pause` → `[0|1]` pauses/resumes detection; `/control/toggle_pause` toggles the pause state.
+- Press `o` in the main window to send a quick `/events/stroke` (with placeholder values) and `/state/count` pair for debugging without waiting for a real detection.
+
+All OSC parameters can be edited live inside the OSC tab (IPv4 addresses are entered as four sliders).
